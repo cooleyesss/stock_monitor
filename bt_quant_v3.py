@@ -1,0 +1,562 @@
+# -*- coding: utf-8 -*-
+"""量化策略v3重构 · 组合级回测器(选股+退出 全历史模拟)
+================================================================
+背景(2026-11-04 用户): quant策略失败率过高(10-14上线以来-10.4%, 往返胜率1/6),
+要求调研机构策略 -> 重构选股与退出 -> 回测调参直到达标。
+
+诊断(quant_trades.csv 6笔往返): v2.5 = 热门板块20日动量TopK追高买入 + MA10紧退出
+  = 买在垂直拉升顶部(德才-15%/大业-6%/凡拓均买在40%+动量末端)、首次回调即止损。
+  调研结论(方正金工《市场的脉搏》): A股仅1日尺度有动量, 周/月尺度为反转效应,
+  追20日高动量统计上必输; 机构做法 = 中期动量(跳过近期) + 短期反转 + 低波动 + 回调入场。
+
+v3新策略(机构路线):
+  门槛: 收盘>MA20 & >MA60 & MA20上行 & 120日跳段动量(剔近10日)≥0
+        & BIAS20≤15% & 5日涨幅≤8% & 20日涨幅≤35%  (趋势内回调, 不追过热)
+  打分: score = w_mom·z(mom120x10) + w_rev·z(-r20) + w_vol·z(-vol20) + w_pull·z(-bias20)
+  退出: MA10 / MA20 / 吊灯(22日最高收盘-k×ATR14) 网格对比; 保留v2.4/v2.5阶梯止盈止损
+  大盘门控(变体): 上证收盘<MA20时暂停新开仓(持仓退出不受影响)
+  仓位: 调仓现金等权分配(与生产一致); 持仓3~5只/每次最多2新/冷却10日/周期5日
+
+对比基准: v2.5复制(20日动量+up_ok门槛+MA10退出)。两变体共享同一宇宙与机制,
+  差异仅在因子与退出(生产v2.5的板块预筛/候选池累积为两变体共同省略项)。
+宇宙: 东财行业板块(~86个)成分股按成交额前15(快照), 无权限/ST剔除, 信号日硬过滤
+  (价≥3元/20日均额≥1亿/自身日K≥130根)。宇宙构成含快照偏差(今日热门明日在册),
+  两变体共享、结论为相对比较, 报告已注明。
+数据: 东财日K前复权 2025-11-01~2026-11-04, JSON磁盘缓存(_bt_tmp/v3_bars_cache.json)
+口径: 严格无未来函数(收盘决策次日开盘成交), 含全套费用, 期初资金387,467.35
+用法: python bt_quant_v3.py [--refresh] [--log 变体关键词] [--params ...调参见main]
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+import requests
+import config_common as C
+import config_quant as Q
+from common import fees
+from common import quotes
+from core.indicators import build_ind
+
+BEG, END = "20250301", "20261104"
+CAPITAL = C.BT_CAPITAL       # 回测期初资金锚点(个性化, config_local.py 覆盖)
+TX_LMT = 420                 # 腾讯回退路径取数根数(需覆盖BEG起全窗口)
+TMP = C.CACHE_DIR            # 运行期缓存目录(个性化路径经 config_local 覆盖)
+BARS_CACHE = os.path.join(TMP, "v3_bars_cache.json")
+UNI_CACHE = os.path.join(TMP, "v3_universe.json")
+IDX = "999999"
+EXCLUDE_PREFIX = ("688", "689", "4", "8", "920")
+WARM = 135                     # 预热bar数(mom120x10需130根)
+TRAIL = Q.DYN_TRAIL_TIERS      # v2.4阶梯止盈(生产现行)
+STOPT = Q.DYN_STOP_TIERS       # v2.5阶梯止损(生产现行)
+
+DEFAULTS = {"mom_min": 0.0, "bias_max": 0.15, "r5_max": 0.08, "r20_max": 0.35,
+            "w": {"mom": 1.0, "rev": 1.0, "vol": 1.0, "pull": 0.5}, "chand_k": 3.0}
+
+
+_TX2_HOSTS = ["https://proxy.finance.qq.com/ifzqgtimg",
+              "https://web.ifzq.gtimg.cn"]
+_TX2_TURN = [0]
+
+
+def _tx2_daily(code):
+    """腾讯双节点直连日K(qfq前复权, 与东财fqt=1同口径); 东财被临时封时的兜底
+    额=量(手)×100×均价 近似(与生产腾讯回退同口径)"""
+    if code == IDX:
+        txc = "sh000001"
+    else:
+        txc = ("sh" if code[0] in "56" else "sz") + code
+    _TX2_TURN[0] += 1
+    host = _TX2_HOSTS[_TX2_TURN[0] % len(_TX2_HOSTS)]
+    url = f"{host}/appstock/app/fqkline/get?param={txc},day,,,{TX_LMT},qfq"
+    r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    d = (r.json().get("data") or {}).get(txc) or {}
+    rows = d.get("qfqday") or d.get("day") or []
+    bars = []
+    for row in rows:
+        try:
+            o, c, h, l, v = (float(row[1]), float(row[2]), float(row[3]),
+                             float(row[4]), float(row[5]))
+        except (ValueError, IndexError):
+            continue
+        bars.append({"dt": str(row[0]), "open": o, "close": c, "high": h,
+                     "low": l, "vol": v, "amount": round(v * 100 * (h + l + c) / 3, 2)})
+    return bars
+
+
+def fetch_daily(code):
+    """日K拉取: 生产级(东财多轮重试->腾讯ifzq) -> 腾讯双节点兜底"""
+    try:
+        bars = quotes._fetch_kline_raw(code, 101, TX_LMT, beg=BEG)
+        if bars:
+            return bars
+    except Exception:
+        pass
+    try:
+        return _tx2_daily(code)
+    except Exception:
+        return []
+
+
+def build_universe(refresh=False):
+    """行业板块成分股(成交额前15/板) -> 去重/剔ST与无权限; 快照缓存当日有效"""
+    if not refresh and os.path.exists(UNI_CACHE):
+        d = json.load(open(UNI_CACHE, encoding="utf-8"))
+        if d.get("end") == END:
+            return d["members"]
+    members, seen = [], set()
+    boards = quotes.fetch_board_list("industry", n=95)
+    print(f"[宇宙] 行业板块 {len(boards)} 个")
+    for b in boards:
+        try:
+            ms = quotes.fetch_board_members(b["bk"], n=15)
+        except Exception as e:
+            print(f"[宇宙] 成分股获取失败 {b['name']}: {e}")
+            continue
+        time.sleep(0.35)
+        for m in ms:
+            c = m["code"]
+            if c in seen or c.startswith(EXCLUDE_PREFIX):
+                continue
+            if "ST" in (m["name"] or "").upper():
+                continue
+            seen.add(c)
+            members.append({"code": c, "name": m["name"], "board": b["name"]})
+    os.makedirs(TMP, exist_ok=True)
+    json.dump({"end": END, "members": members},
+              open(UNI_CACHE, "w", encoding="utf-8"), ensure_ascii=False)
+    return members
+
+
+def load_bars(members, refresh=False):
+    cache = {}
+    if not refresh and os.path.exists(BARS_CACHE):
+        d = json.load(open(BARS_CACHE, encoding="utf-8"))
+        if d.get("beg") == BEG and d.get("end") == END:
+            cache = d["data"]
+    codes = {IDX: "上证指数"}
+    codes.update({m["code"]: m["name"] for m in members})
+    todo = [c for c in codes if c not in cache]
+    dirty, fail = False, 0
+    for i, code in enumerate(todo):
+        bars = fetch_daily(code)
+        time.sleep(0.22)              # 节流: 防腾讯源连续快速请求被WAF拦截
+        if code == IDX:
+            if bars:
+                cache[code] = {"name": "上证指数", "bars": bars}
+                dirty = True
+            else:
+                print("[行情] 指数K线获取失败, 终止")
+                sys.exit(1)
+            continue
+        if len(bars) < 150:            # 上市过晚/拉取失败: 无预热所需历史
+            fail += 1
+            continue
+        cache[code] = {"name": codes[code], "bars": bars}
+        dirty = True
+        if (i + 1) % 50 == 0:
+            print(f"[行情] {i + 1}/{len(todo)} 累计{len(cache) - 1}只 fail={fail}")
+    # 失败重试一轮(腾讯源偶发限流, 缓存重启进程也可增量补)
+    retry = [c for c in codes if c not in cache and c != IDX]
+    for j, code in enumerate(retry):
+        time.sleep(0.5)
+        bars = fetch_daily(code)
+        if len(bars) >= 150:
+            cache[code] = {"name": codes[code], "bars": bars}
+            dirty = True
+        if (j + 1) % 50 == 0:
+            print(f"[重试] {j + 1}/{len(retry)}")
+    fail = len([c for c in codes if c not in cache and c != IDX])
+    if fail:
+        print(f"[行情] {fail}只未取得(上市晚或无数据)")
+    if dirty:
+        json.dump({"beg": BEG, "end": END, "data": cache},
+                  open(BARS_CACHE, "w", encoding="utf-8"), ensure_ascii=False)
+    return cache
+
+
+def prep(code, name, bars):
+    """预计算指标与因子原料(全部只用截至当根收盘, 无未来)"""
+    ind = build_ind(bars)
+    closes = [b["close"] for b in bars]
+    n = len(bars)
+    vol20 = [None] * n
+    for i in range(19, n):
+        rs = [closes[k] / closes[k - 1] - 1 for k in range(i - 19, i + 1)]
+        m = sum(rs) / 20
+        vol20[i] = (sum((x - m) ** 2 for x in rs) / 20) ** 0.5
+    return {"code": code, "name": name, "bars": bars, "ind": ind,
+            "closes": closes, "vol20": vol20,
+            "dates": [b["dt"][:10] for b in bars],
+            "dmap": {b["dt"][:10]: j for j, b in enumerate(bars)}}
+
+
+def _lp(code):
+    return 0.198 if code[:3] in ("300", "301", "688", "689") else 0.098
+
+
+def snap(st, j, code):
+    """收盘j因子快照; 指标未就绪返回None"""
+    ind = st["ind"]
+    cl = st["closes"][j]
+    ma20, ma5, ma10, ma60 = (ind["ma20"][j], ind["ma5"][j],
+                             ind["ma10"][j], ind["ma60"][j])
+    if None in (ma20, ma5, ma10, ma60) or j < 130:
+        return None
+    closes = st["closes"]
+    ma20up = ind["ma20"][j - 5] is not None and ma20 > ind["ma20"][j - 5]
+    mom20 = closes[j] / closes[j - 20] - 1
+    m120 = closes[j - 10] / closes[j - 130] - 1
+    r5 = closes[j] / closes[j - 5] - 1
+    amt20 = sum(b["amount"] for b in st["bars"][j - 19:j + 1]) / 20
+    w = st["bars"][j - 9:j + 1]
+    lu = sum(1 for k in range(1, len(w))
+             if w[k]["close"] / w[k - 1]["close"] - 1 >= _lp(code))
+    extreme = lu >= 3 or mom20 >= 1.0 or r5 >= 0.30
+    return {"cl": cl, "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60,
+            "ma20up": ma20up, "mom20": mom20, "m120": m120, "r5": r5,
+            "bias": cl / ma20 - 1, "amt20": amt20, "vol20": st["vol20"][j],
+            "extreme": extreme}
+
+
+def _zscore(cands, key, sign=1.0):
+    xs = [sign * c["sp"][key] for c in cands]
+    if not xs:
+        return
+    mu = sum(xs) / len(xs)
+    sd = (sum((x - mu) ** 2 for x in xs) / len(xs)) ** 0.5
+    for c, x in zip(cands, xs):
+        c["z_" + key] = (x - mu) / sd if sd > 0 else 0.0
+
+
+def simulate(U, cal, V):
+    """组合级模拟: 调仓(收盘决策)->次日开盘成交; 退出同口径"""
+    P = dict(DEFAULTS)
+    P.update(V.get("params") or {})
+    cd = V.get("cooldown", Q.PICK_COOLDOWN)
+    cal_idx = {d: i for i, d in enumerate(cal)}
+    ic = [U[IDX]["closes"][i] for i in range(len(cal))]
+
+    def _sma(w):
+        out = [None] * len(cal)
+        s = 0.0
+        for i in range(len(cal)):
+            s += ic[i]
+            if i >= w:
+                s -= ic[i - w]
+            if i >= w - 1:
+                out[i] = s / w
+        return out
+
+    isma = {20: _sma(20), 60: _sma(60)}
+    cash = CAPITAL
+    pos, pend_buy, pend_sell = {}, [], set()
+    last_sell, last_reb = {}, -999
+    trades, equity, picks_log = [], [], []
+
+    for ti in range(WARM, len(cal)):
+        t = cal[ti]
+        # ① 开盘执行挂单
+        for pb in [x for x in pend_buy]:
+            st = U.get(pb["code"])
+            j = st["dmap"].get(t) if st else None
+            if j is None:
+                continue                       # 停牌顺延
+            o = st["bars"][j]["open"]
+            q = int(pb["alloc"] / o // 100 * 100)
+            while q >= 100:
+                amt = round(q * o, 2)
+                if amt + fees.buy_fee(amt, pb["code"]) <= pb["alloc"]:
+                    break
+                q -= 100
+            if q < 100 or round(q * o, 2) + fees.buy_fee(round(q * o, 2), pb["code"]) > cash:
+                pend_buy.remove(pb)
+                continue
+            amt = round(q * o, 2)
+            f = fees.buy_fee(amt, pb["code"])
+            cash -= amt + f
+            pos[pb["code"]] = {"sh": q, "cost": amt + f, "entry": o, "hmax": o,
+                               "bi": j, "date": t, "last_j": j}
+            pend_buy.remove(pb)
+        for code in [x for x in pend_sell]:
+            st = U.get(code)
+            j = st["dmap"].get(t) if st else None
+            if j is None:
+                continue
+            p = pos.get(code)
+            if not p:
+                pend_sell.discard(code)
+                continue
+            o = st["bars"][j]["open"]
+            amt = round(p["sh"] * o, 2)
+            f = fees.sell_fee(amt, code)
+            cash += amt - f
+            trades.append({"code": code, "name": st["name"], "sh": p["sh"],
+                           "cost": p["cost"], "entry": p["entry"],
+                           "buy_date": p["date"], "sell_date": t, "sell_px": o,
+                           "pnl": amt - f - p["cost"],
+                           "ret": (amt - f) / p["cost"] - 1,
+                           "reason": p.get("exit_sig", "")})
+            del pos[code]
+            last_sell[code] = t
+            pend_sell.discard(code)
+        # ② 收盘退出检查(阶梯止盈/止损 + 变体退出)
+        for code, p in pos.items():
+            if code in pend_sell:
+                continue
+            st = U[code]
+            j = st["dmap"].get(t)
+            if j is None or j < p["bi"]:
+                continue
+            cl = st["closes"][j]
+            p["hmax"] = max(p["hmax"], cl)
+            ent, pc = p["entry"], cl
+            sig = None
+            pf = pc / ent - 1
+            if not V.get("no_trail"):
+                for th, bw in TRAIL:
+                    if pf >= th:
+                        if pc <= p["hmax"] * (1 - bw):
+                            sig = f"移动止盈{bw * 100:.0f}%"
+                        break
+            if not sig:
+                pfh = p["hmax"] / ent - 1
+                for th, ln in STOPT:
+                    if pfh >= th:
+                        if pc < ent * ln:
+                            sig = "阶梯止损"
+                        break
+            if not sig:
+                if V["exit"] == "ma10" and cl < st["ind"]["ma10"][j]:
+                    sig = "破MA10"
+                elif V["exit"] == "ma20" and cl < st["ind"]["ma20"][j]:
+                    sig = "破MA20"
+                elif V["exit"] == "chand":
+                    hh = max(st["closes"][j - 21:j + 1])
+                    atr = st["ind"]["atr"][j]
+                    if atr and cl < hh - P["chand_k"] * atr:
+                        sig = "吊灯止损"
+            if sig:
+                p["exit_sig"] = sig
+                pend_sell.add(code)
+        # ③ 收盘调仓判定
+        n_busy = len(pos) + len(pend_buy)
+        due = ti - last_reb >= Q.PICK_REBAL
+        early = n_busy < Q.PICK_MIN_HOLD
+        if due or early:
+            last_reb = ti
+            cands = []
+            for code, st in U.items():
+                if code == IDX or code in pos:
+                    continue
+                if any(pb["code"] == code for pb in pend_buy):
+                    continue
+                j = st["dmap"].get(t)
+                if j is None:
+                    continue
+                sp = snap(st, j, code)
+                if sp is None:
+                    continue
+                if sp["cl"] < Q.PICK_MIN_PRICE or sp["amt20"] < Q.PICK_MIN_AMOUNT:
+                    continue
+                ls = last_sell.get(code)
+                if ls and cal_idx[t] - cal_idx[ls] < cd:
+                    continue
+                if V["entry"] == "v25":
+                    ok = (sp["cl"] > sp["ma20"] and sp["ma5"] > sp["ma10"]
+                          and sp["cl"] > sp["ma60"] and sp["ma20up"]
+                          and sp["mom20"] > Q.PICK_MOM_MIN)
+                    if not ok:
+                        continue
+                    cands.append({"code": code, "name": st["name"], "sp": sp,
+                                  "score": sp["mom20"],
+                                  "extreme": sp["extreme"]})
+                else:
+                    ok = (sp["cl"] > sp["ma20"] and sp["cl"] > sp["ma60"]
+                          and sp["ma20up"] and sp["m120"] >= P["mom_min"]
+                          and sp["bias"] <= P["bias_max"]
+                          and sp["r5"] <= P["r5_max"]
+                          and sp["mom20"] <= P["r20_max"])
+                    if not ok:
+                        continue
+                    cands.append({"code": code, "name": st["name"], "sp": sp,
+                                  "extreme": sp["extreme"]})
+            if V["entry"] == "v3" and cands:
+                w = P["w"]
+                _zscore(cands, "m120", 1.0)
+                _zscore(cands, "mom20", -1.0)      # 短期反转: 近20日涨幅低者加分
+                _zscore(cands, "vol20", -1.0)      # 低波动加分
+                _zscore(cands, "bias", -1.0)       # 距MA20越近越好(回调入场)
+                for c in cands:
+                    c["score"] = (w["mom"] * c["z_m120"] + w["rev"] * c["z_mom20"]
+                                  + w["vol"] * c["z_vol20"] + w["pull"] * c["z_bias"])
+            cands.sort(key=lambda c: (c["extreme"], -c["score"]))
+            gate_ok = True
+            if V.get("mkt_gate"):
+                gm = isma[V.get("gate_ma", 20)][ti]
+                gate_ok = gm is None or ic[ti] > gm
+            max_new = min(Q.PICK_TOPK, Q.PICK_MAX_HOLD - n_busy)
+            picks = []
+            if gate_ok and max_new > 0:
+                picks = [c for c in cands if not c["extreme"]][:max_new] or cands[:max_new]
+            picks_log.append({"date": t, "trig": "early" if early else "due",
+                              "gate": gate_ok, "cands": len(cands),
+                              "picks": [{"code": c["code"], "name": c["name"],
+                                         "score": round(c["score"], 3),
+                                         "mom20": round(c["sp"]["mom20"], 3),
+                                         "m120": round(c["sp"]["m120"], 3),
+                                         "bias": round(c["sp"]["bias"], 3)}
+                                        for c in picks]})
+            if picks:
+                alloc = cash / len(picks)
+                for c in picks:
+                    if alloc < c["sp"]["cl"] * 100 * 1.01:
+                        continue
+                    pend_buy.append({"code": c["code"], "alloc": alloc})
+        # ④ 逐日盯市
+        mv = 0.0
+        for code, p in pos.items():
+            st = U[code]
+            j = st["dmap"].get(t)
+            if j is not None:
+                p["last_j"] = j
+            mv += p["sh"] * st["closes"][p["last_j"]]
+        equity.append(cash + mv)
+
+    # 期末未平仓按最后收盘估值并入trades统计(标记open)
+    for code, p in pos.items():
+        st = U[code]
+        px = st["closes"][p["last_j"]]
+        amt = p["sh"] * px
+        trades.append({"code": code, "name": st["name"], "sh": p["sh"],
+                       "cost": p["cost"], "entry": p["entry"], "buy_date": p["date"],
+                       "sell_date": cal[-1], "sell_px": px, "open": True,
+                       "pnl": amt - p["cost"], "ret": amt / p["cost"] - 1,
+                       "reason": "期末持仓" + (("(" + p.get("exit_sig", "") + ")")
+                                            if code in pend_sell else "")})
+    return {"trades": trades, "equity": equity, "picks_log": picks_log,
+            "cal": cal[WARM:], "cash": cash, "npos": len(pos)}
+
+
+def metrics(res):
+    eq = res["equity"]
+    cal = res["cal"]
+    cal_idx = {d: i for i, d in enumerate(cal)}
+    total = eq[-1] / CAPITAL - 1 if eq else 0.0
+    days = len(eq)
+    ann = (eq[-1] / CAPITAL) ** (244 / max(days, 1)) - 1 if eq and days > 5 else 0.0
+    mdd, peak = 0.0, eq[0] if eq else 1
+    for v in (eq or [1]):
+        peak = max(peak, v)
+        mdd = min(mdd, v / peak - 1)
+    half = max(days // 2, 1)
+    h1 = eq[half] / eq[0] - 1 if days > 10 else 0.0
+    h2 = eq[-1] / eq[half] - 1 if days > 10 else 0.0
+    closed = [t for t in res["trades"] if not t.get("open")]
+    wins = [t for t in closed if t["pnl"] > 0]
+    losses = [t for t in closed if t["pnl"] <= 0]
+    winr = len(wins) / len(closed) if closed else 0.0
+    aw = sum(t["pnl"] for t in wins) / len(wins) if wins else 0.0
+    al = sum(t["pnl"] for t in losses) / len(losses) if losses else 0.0
+    pf = (sum(t["pnl"] for t in wins) / -sum(t["pnl"] for t in losses)
+          if losses and sum(t["pnl"] for t in losses) < 0 else float("inf"))
+    hold = (sum(cal_idx[t["sell_date"]] - cal_idx[t["buy_date"]]
+                for t in closed) / len(closed) if closed else 0.0)
+    wins_pnl = sorted((t["pnl"] for t in closed if t["pnl"] > 0), reverse=True)
+    net = sum(t["pnl"] for t in closed)
+    conc = (sum(wins_pnl[:3]) / net) if net > 0 and wins_pnl else 0.0
+    return {"total": total, "ann": ann, "mdd": mdd, "n": len(closed),
+            "winr": winr, "aw": aw, "al": al, "pf": pf, "hold": hold,
+            "h1": h1, "h2": h2, "conc": conc,
+            "open": len(res["trades"]) - len(closed)}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--log", default="")
+    args = ap.parse_args()
+    members = build_universe(refresh=args.refresh)
+    print(f"[宇宙] 成分股去重后 {len(members)} 只")
+    data = load_bars(members, refresh=args.refresh)
+    U = {c: prep(c, v["name"], v["bars"]) for c, v in data.items()}
+    cal = U[IDX]["dates"]
+    print(f"[行情] 就绪 {len(U)} 只(含指数), 交易日 {len(cal)} 根, "
+          f"模拟窗口 {cal[WARM]} ~ {cal[-1]} ({len(cal) - WARM}日)")
+
+    F0 = {"chand_k": 2.0, "r5_max": 0.06, "r20_max": 0.45,
+          "w": {"mom": 0.5, "rev": 1.0, "vol": 1.0, "pull": 0.5}}
+    VARIANTS = [
+        {"name": "v2.5复制·20日动量+MA10", "entry": "v25", "exit": "ma10"},
+        {"name": "R5·F0(ch2.0/r5.06/r20.45/m0.5)",
+         "entry": "v3", "exit": "chand", "mkt_gate": 20, "params": F0},
+        {"name": "R5·F0+ch1.75", "entry": "v3", "exit": "chand", "mkt_gate": 20,
+         "params": {**F0, "chand_k": 1.75}},
+        {"name": "R5·F0+ch2.25", "entry": "v3", "exit": "chand", "mkt_gate": 20,
+         "params": {**F0, "chand_k": 2.25}},
+        {"name": "R5·F0+r20.50", "entry": "v3", "exit": "chand", "mkt_gate": 20,
+         "params": {**F0, "r20_max": 0.50}},
+        {"name": "R5·F0+r5.07", "entry": "v3", "exit": "chand", "mkt_gate": 20,
+         "params": {**F0, "r5_max": 0.07}},
+        {"name": "R5·F0+mom0.6", "entry": "v3", "exit": "chand", "mkt_gate": 20,
+         "params": {**F0, "w": {"mom": 0.6, "rev": 1.0, "vol": 1.0, "pull": 0.5}}},
+        {"name": "R5·F0+pull0.75", "entry": "v3", "exit": "chand", "mkt_gate": 20,
+         "params": {**F0, "w": {"mom": 0.5, "rev": 1.0, "vol": 1.0, "pull": 0.75}}},
+        {"name": "R5·F0+vol1.5", "entry": "v3", "exit": "chand", "mkt_gate": 20,
+         "params": {**F0, "w": {"mom": 0.5, "rev": 1.0, "vol": 1.5, "pull": 0.5}}},
+        {"name": "R5·F0+冷却15", "entry": "v3", "exit": "chand", "mkt_gate": 20,
+         "cooldown": 15, "params": F0},
+    ]
+    idx_ret = U[IDX]["closes"][-1] / U[IDX]["closes"][WARM] - 1
+    ew = []
+    for c, st in U.items():
+        if c == IDX:
+            continue
+        j0 = max((st["dmap"].get(d, -1) for d in cal[WARM:WARM + 5]), default=-1)
+        if j0 and j0 > 0 and st["closes"][-1] > 0:
+            ew.append(st["closes"][-1] / st["closes"][j0] - 1)
+    print(f"[基准] 上证指数 {idx_ret * 100:+.2f}% | 宇宙等权 "
+          f"{sum(ew) / len(ew) * 100:+.2f}% ({len(ew)}只)\n")
+
+    hdr = (f"{'变体':<24}{'总收益':>9}{'年化':>8}{'MDD':>8}{'H1':>8}{'H2':>8}"
+           f"{'笔数':>5}{'胜率':>7}{'PF':>6}{'集中度':>7}{'均持':>6}")
+    print(hdr)
+    print("-" * 105)
+    results = {}
+    for V in VARIANTS:
+        res = simulate(U, cal, V)
+        m = metrics(res)
+        results[V["name"]] = (res, m)
+        print(f"{V['name']:<24}{m['total'] * 100:>+8.2f}%{m['ann'] * 100:>+7.1f}%"
+              f"{m['mdd'] * 100:>7.1f}%{m['h1'] * 100:>+7.1f}%{m['h2'] * 100:>+7.1f}%"
+              f"{m['n']:>5}{m['winr'] * 100:>6.1f}%{m['pf']:>6.2f}"
+              f"{m['conc'] * 100:>6.0f}%{m['hold']:>6.1f}"
+              + (f" 持{m['open']}" if m["open"] else ""))
+    if args.log:
+        for name, (res, m) in results.items():
+            if args.log in name:
+                print(f"\n[{name}] 调仓明细:")
+                for pl in res["picks_log"]:
+                    ps = ", ".join(f"{p['name']}(s={p['score']},mom20={p['mom20'] * 100:+.0f}%,"
+                                   f"m120={p['m120'] * 100:+.0f}%,bias={p['bias'] * 100:+.0f}%)"
+                                   for p in pl["picks"]) or "-"
+                    print(f"  {pl['date']} [{pl['trig']}] gate={pl['gate']} "
+                          f"cands={pl['cands']}: {ps}")
+                print("  成交明细:")
+                for t in res["trades"]:
+                    print(f"    {t['buy_date']}买{t['name']}@{t['entry']:.2f} -> "
+                          f"{t['sell_date']}卖@{t['sell_px']:.2f} "
+                          f"{t['ret'] * 100:+.1f}% {t['reason']}"
+                          + ("(open)" if t.get("open") else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

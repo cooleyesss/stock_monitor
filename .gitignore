@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行期日志与生成产物(每日自动重建, 不入库)
+monitor.log
+monitor_err.log
+report/
+data/
+*.log
+
+# 回测历史产物
+backtest_signals_*.csv
+backtest_summary_*.csv
+
+# 备份文件
+*.bak
+*.bak_*
+mystock_test.csv.*bak
+
+# Trae 分享包等生成产物
+.trae-html-share-packages/
+
+# 个性化配置与个人数据(用户自行配置, 严禁入库)
+# config_local.py: token/key/机器路径/剔除名单/资金锚点/持仓成本(参照 config_local_template.py)
+config_local.py
+# mystock_test.csv: 真实持仓母表(用户维护)
+mystock_test.csv
+# .trae/: 本地需求方案文档
+.trae/
+
+# 线下台账(非代码)
+每月成本.xlsx
