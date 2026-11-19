@@ -25,9 +25,24 @@ v3新策略(机构路线):
 数据: 东财日K前复权 2025-11-01~2026-11-04, JSON磁盘缓存(_bt_tmp/v3_bars_cache.json)
 口径: 严格无未来函数(收盘决策次日开盘成交), 含全套费用, 期初资金387,467.35
 用法: python bt_quant_v3.py [--refresh] [--log 变体关键词] [--params ...调参见main]
+
+2026-11-18 扩展(图片策略融合回测): 新增7个日K代理因子进z-score网格 ——
+  vr量比 / act活跃度适中(-|z(log amt20)|) / bd板块动量(板内均值mom20) /
+  pos距20日高 / cpos日内收盘位(近5日(C-L)/(H-L), 分时指标代理) /
+  lsb股板同向率 / lbm板市同向率(个股->板块->大盘三层联动; 注: 板块超额动量
+  在截面z-score下与bd等价(常数平移不变), 故板市联动用同向率而非超额)。
+  最近窗口涨幅不新增(已被现有rev/m120覆盖, 与"A股周月尺度反转"结论冲突)。
+
+2026-11-19 第四轮(图片指标原口径三轮回测, 用户指令): 新增3因子 ——
+  irank个股行业内涨幅分位(候选mom20在其板内当日有效成员>=3只中的分位, 越高=
+  板内温和领涨) / brank行业全市场排名分位(板块mom20均值在全部有效板块中的分位) /
+  btier板块属性非单调档位(温和领涨[cold,hot]区=+1, 过热>hot或冷淡<cold=-1)。
+  三轮: R1 --days 0 全窗口 / R2 --days 120 半年窗口 / R3 --perturb 参数扰动
+  (权重0.25/0.75档+btier_hot阈值8%/12%/15%+因子组合)。基线=v4现行五因子。
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -53,11 +68,25 @@ UNI_CACHE = os.path.join(TMP, "v3_universe.json")
 IDX = "999999"
 EXCLUDE_PREFIX = ("688", "689", "4", "8", "920")
 WARM = 135                     # 预热bar数(mom120x10需130根)
+SIM_DAYS = 120                 # 模拟窗口长度(交易日; 2026-11-18用户要求缩短至半年,
+                               #  取日历末段N日, 预热仍用全历史; 0=全窗口)
 TRAIL = Q.DYN_TRAIL_TIERS      # v2.4阶梯止盈(生产现行)
 STOPT = Q.DYN_STOP_TIERS       # v2.5阶梯止损(生产现行)
 
 DEFAULTS = {"mom_min": 0.0, "bias_max": 0.15, "r5_max": 0.08, "r20_max": 0.35,
-            "w": {"mom": 1.0, "rev": 1.0, "vol": 1.0, "pull": 0.5}, "chand_k": 3.0}
+            "w": {"mom": 1.0, "rev": 1.0, "vol": 1.0, "pull": 0.5},
+            "chand_k": 3.0, "btier_hot": 0.10, "btier_cold": 0.0}
+
+# 2026-11-18 图片策略融合: 因子注册表(权重键 -> (sp字段, z-score符号)); act特殊处理
+# 2026-11-19 irank/brank/btier: 板内分位/板块间分位为[0,1](越高越领涨, sign=+1);
+#   btier档位值±1自带方向(温和+1/过热冷淡-1), z-score后加权
+FACTORS = {"mom": ("m120", 1.0), "rev": ("mom20", -1.0), "vol": ("vol20", -1.0),
+           "pull": ("bias", -1.0), "vr": ("vr", 1.0), "bd": ("bmom", 1.0),
+           "pos": ("pos20", 1.0), "cpos": ("cpos5", 1.0),
+           "lsb": ("lnk_sb", 1.0), "lbm": ("lnk_bm", 1.0),
+           "irank": ("irank", 1.0), "brank": ("brank", 1.0),
+           "btier": ("btier", 1.0)}
+BRET = {}    # 板块等权日收益序列(main预计算一次, simulate只读)
 
 
 _TX2_HOSTS = ["https://proxy.finance.qq.com/ifzqgtimg",
@@ -182,7 +211,7 @@ def load_bars(members, refresh=False):
     return cache
 
 
-def prep(code, name, bars):
+def prep(code, name, bars, board=""):
     """预计算指标与因子原料(全部只用截至当根收盘, 无未来)"""
     ind = build_ind(bars)
     closes = [b["close"] for b in bars]
@@ -193,7 +222,7 @@ def prep(code, name, bars):
         m = sum(rs) / 20
         vol20[i] = (sum((x - m) ** 2 for x in rs) / 20) ** 0.5
     return {"code": code, "name": name, "bars": bars, "ind": ind,
-            "closes": closes, "vol20": vol20,
+            "closes": closes, "vol20": vol20, "board": board,
             "dates": [b["dt"][:10] for b in bars],
             "dmap": {b["dt"][:10]: j for j, b in enumerate(bars)}}
 
@@ -220,20 +249,93 @@ def snap(st, j, code):
     lu = sum(1 for k in range(1, len(w))
              if w[k]["close"] / w[k - 1]["close"] - 1 >= _lp(code))
     extreme = lu >= 3 or mom20 >= 1.0 or r5 >= 0.30
+    # ---- 2026-11-18 图片策略融合: 日K代理因子(全用截至j收盘数据, 无未来) ----
+    w5 = st["bars"][j - 4:j + 1]
+    v20 = sum(b["vol"] for b in st["bars"][j - 19:j + 1])
+    vr = (sum(b["vol"] for b in w5) / 5.0) / (v20 / 20.0) if v20 > 0 else None
+    hh20 = max(closes[j - 19:j + 1])
+    pos20 = cl / hh20 - 1 if hh20 > 0 else None
+    cps = [(b["close"] - b["low"]) / (b["high"] - b["low"])
+           for b in w5 if b["high"] > b["low"]]
+    cpos5 = sum(cps) / len(cps) if cps else 0.5
+    lamt = math.log(amt20) if amt20 > 0 else None
     return {"cl": cl, "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60,
             "ma20up": ma20up, "mom20": mom20, "m120": m120, "r5": r5,
             "bias": cl / ma20 - 1, "amt20": amt20, "vol20": st["vol20"][j],
-            "extreme": extreme}
+            "extreme": extreme, "vr": vr, "pos20": pos20, "cpos5": cpos5,
+            "lamt": lamt}
 
 
 def _zscore(cands, key, sign=1.0):
-    xs = [sign * c["sp"][key] for c in cands]
+    """截面z-score(None容错: 缺失记z=0中性, 不影响mu/sd; 与生产_zscore_v3同口径)"""
+    xs = [sign * c["sp"][key] for c in cands if c["sp"].get(key) is not None]
     if not xs:
+        for c in cands:
+            c["z_" + key] = 0.0
         return
     mu = sum(xs) / len(xs)
     sd = (sum((x - mu) ** 2 for x in xs) / len(xs)) ** 0.5
-    for c, x in zip(cands, xs):
-        c["z_" + key] = (x - mu) / sd if sd > 0 else 0.0
+    for c in cands:
+        v = c["sp"].get(key)
+        c["z_" + key] = ((sign * v - mu) / sd if sd > 0 else 0.0
+                         ) if v is not None else 0.0
+
+
+def _board_series(U, cal):
+    """板块等权日收益序列(对齐指数日历; 当日>=3只成员有行情才记值)
+    -> {board: {date: eq_weight_daily_ret}}"""
+    groups = {}
+    for code, st in U.items():
+        if code != IDX and st.get("board"):
+            groups.setdefault(st["board"], []).append(st)
+    out = {}
+    for bname, sts in groups.items():
+        rets = {}
+        for i in range(1, len(cal)):
+            d, pd = cal[i], cal[i - 1]
+            rs = []
+            for st in sts:
+                j, pj = st["dmap"].get(d), st["dmap"].get(pd)
+                if j is not None and pj is not None and st["closes"][pj] > 0:
+                    rs.append(st["closes"][j] / st["closes"][pj] - 1)
+            if len(rs) >= 3:
+                rets[d] = sum(rs) / len(rs)
+        out[bname] = rets
+    return out
+
+
+def _lnk_sb(st, j, bret_b):
+    """股板同向率: 近20交易日个股与板块等权日收益同向(同涨同跌)天数占比
+    <10个有效日返回None(记中性); 高=板块驱动, 低=独立行情"""
+    if not bret_b:
+        return None
+    agree = n = 0
+    for k in range(j - 19, j + 1):
+        br = bret_b.get(st["dates"][k])
+        if br is None or st["closes"][k - 1] <= 0:
+            continue
+        sr = st["closes"][k] / st["closes"][k - 1] - 1
+        n += 1
+        if (sr > 0) == (br > 0):
+            agree += 1
+    return agree / n if n >= 10 else None
+
+
+def _lnk_bm(bret_b, cal, ic, ti):
+    """板市同向率: 近20交易日板块等权日收益与大盘指数同向天数占比
+    <10个有效日返回None(记中性); 高=与大盘共振"""
+    if not bret_b:
+        return None
+    agree = n = 0
+    for k in range(max(1, ti - 19), ti + 1):
+        br = bret_b.get(cal[k])
+        if br is None or ic[k - 1] <= 0:
+            continue
+        mr = ic[k] / ic[k - 1] - 1
+        n += 1
+        if (br > 0) == (mr > 0):
+            agree += 1
+    return agree / n if n >= 10 else None
 
 
 def simulate(U, cal, V):
@@ -261,7 +363,9 @@ def simulate(U, cal, V):
     last_sell, last_reb = {}, -999
     trades, equity, picks_log = [], [], []
 
-    for ti in range(WARM, len(cal)):
+    # 模拟窗口: 日历末段SIM_DAYS日(0=全窗口); 预热指标仍由WARM前全历史计算
+    t0 = max(WARM, len(cal) - SIM_DAYS) if SIM_DAYS else WARM
+    for ti in range(t0, len(cal)):
         t = cal[ti]
         # ① 开盘执行挂单
         for pb in [x for x in pend_buy]:
@@ -387,16 +491,62 @@ def simulate(U, cal, V):
                     if not ok:
                         continue
                     cands.append({"code": code, "name": st["name"], "sp": sp,
-                                  "extreme": sp["extreme"]})
+                                  "j": j, "extreme": sp["extreme"]})
             if V["entry"] == "v3" and cands:
                 w = P["w"]
-                _zscore(cands, "m120", 1.0)
-                _zscore(cands, "mom20", -1.0)      # 短期反转: 近20日涨幅低者加分
-                _zscore(cands, "vol20", -1.0)      # 低波动加分
-                _zscore(cands, "bias", -1.0)       # 距MA20越近越好(回调入场)
+                # ---- 板块层因子(2026-11-18 三层联动) ----
+                # bd 板块动量: 板内当日有效成员(>=3只)的20日涨幅均值
+                # lbm 板市同向率 / lsb 股板同向率(见函数docstring)
+                acc = {}
+                for code2, st2 in U.items():
+                    if code2 == IDX or not st2.get("board"):
+                        continue
+                    jj = st2["dmap"].get(t)
+                    if jj is not None and jj >= 20 and st2["closes"][jj - 20] > 0:
+                        acc.setdefault(st2["board"], []).append(
+                            st2["closes"][jj] / st2["closes"][jj - 20] - 1)
+                bmean = {b: sum(v) / len(v) for b, v in acc.items() if len(v) >= 3}
+                # ---- 2026-11-19 图片指标原口径: irank/brank/btier ----
+                # irank 候选mom20在其板内有效成员分位 / brank 板块动量在板块间分位
+                # btier 板块非单调档位: 温和[cold,hot]=+1, 过热/冷淡=-1
+                use_ibt = any(w.get(k, 0) for k in ("irank", "brank", "btier"))
+                bmv = sorted(bmean.values()) if (use_ibt and bmean) else []
+                hot, cold = P["btier_hot"], P["btier_cold"]
+                lbm_cache = {}
                 for c in cands:
-                    c["score"] = (w["mom"] * c["z_m120"] + w["rev"] * c["z_mom20"]
-                                  + w["vol"] * c["z_vol20"] + w["pull"] * c["z_bias"])
+                    st = U[c["code"]]
+                    bd_ = st.get("board")
+                    if bd_ not in lbm_cache:
+                        lbm_cache[bd_] = _lnk_bm(BRET.get(bd_), cal, ic, ti)
+                    c["sp"]["bmom"] = bmean.get(bd_)
+                    c["sp"]["lnk_bm"] = lbm_cache[bd_]
+                    c["sp"]["lnk_sb"] = _lnk_sb(st, c["j"], BRET.get(bd_))
+                    if use_ibt:
+                        vals = acc.get(bd_) or []
+                        if bd_ in bmean and len(vals) > 1:
+                            c["sp"]["irank"] = (
+                                sum(1 for v in vals if v < c["sp"]["mom20"])
+                                / (len(vals) - 1))
+                            lo_b = sum(1 for v in bmv if v < bmean[bd_])
+                            c["sp"]["brank"] = (lo_b / (len(bmv) - 1)
+                                                if len(bmv) > 1 else 0.5)
+                            bm = bmean[bd_]
+                            c["sp"]["btier"] = (1.0 if cold <= bm <= hot else -1.0)
+                        else:
+                            c["sp"]["irank"] = c["sp"]["brank"] = None
+                            c["sp"]["btier"] = None
+                for key, (src, sign) in FACTORS.items():
+                    if w.get(key, 0):
+                        _zscore(cands, src, sign)
+                if w.get("act", 0):   # 活跃度适中: 距截面流动性档位中位越近越好
+                    _zscore(cands, "lamt", 1.0)
+                    for c in cands:
+                        c["z_act"] = -abs(c["z_lamt"])
+                for c in cands:
+                    c["score"] = sum(w[k] * c["z_" + FACTORS[k][0]]
+                                     for k in FACTORS if w.get(k, 0))
+                    if w.get("act", 0):
+                        c["score"] += w["act"] * c["z_act"]
             cands.sort(key=lambda c: (c["extreme"], -c["score"]))
             gate_ok = True
             if V.get("mkt_gate"):
@@ -442,7 +592,7 @@ def simulate(U, cal, V):
                        "reason": "期末持仓" + (("(" + p.get("exit_sig", "") + ")")
                                             if code in pend_sell else "")})
     return {"trades": trades, "equity": equity, "picks_log": picks_log,
-            "cal": cal[WARM:], "cash": cash, "npos": len(pos)}
+            "cal": cal[t0:], "cash": cash, "npos": len(pos)}
 
 
 def metrics(res):
@@ -482,44 +632,71 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--log", default="")
+    ap.add_argument("--days", type=int, default=None,
+                    help="模拟窗口交易日数(0=全窗口, 默认=SIM_DAYS现行120)")
+    ap.add_argument("--perturb", action="store_true",
+                   help="R3参数扰动变体集(权重档+btier阈值+组合)")
     args = ap.parse_args()
+    global SIM_DAYS
+    if args.days is not None:
+        SIM_DAYS = args.days
     members = build_universe(refresh=args.refresh)
     print(f"[宇宙] 成分股去重后 {len(members)} 只")
     data = load_bars(members, refresh=args.refresh)
-    U = {c: prep(c, v["name"], v["bars"]) for c, v in data.items()}
+    bmap = {m["code"]: m["board"] for m in members}
+    U = {c: prep(c, v["name"], v["bars"], bmap.get(c, ""))
+         for c, v in data.items()}
     cal = U[IDX]["dates"]
+    global BRET
+    BRET = _board_series(U, cal)
+    t0 = max(WARM, len(cal) - SIM_DAYS) if SIM_DAYS else WARM
     print(f"[行情] 就绪 {len(U)} 只(含指数), 交易日 {len(cal)} 根, "
-          f"模拟窗口 {cal[WARM]} ~ {cal[-1]} ({len(cal) - WARM}日)")
+          f"模拟窗口 {cal[t0]} ~ {cal[-1]} ({len(cal) - t0}日)")
 
+    # 基线=v4现行五因子(mom0.5/rev1/vol1/pull0.5/vr0.5, chand2.0, 5日6%/20日45%)
     F0 = {"chand_k": 2.0, "r5_max": 0.06, "r20_max": 0.45,
-          "w": {"mom": 0.5, "rev": 1.0, "vol": 1.0, "pull": 0.5}}
+          "w": {"mom": 0.5, "rev": 1.0, "vol": 1.0, "pull": 0.5, "vr": 0.5}}
+
+    def _v(nm, **kw):
+        w = dict(F0["w"])
+        w.update(kw.pop("w", {}))
+        return {"name": nm, "entry": "v3", "exit": "chand", "mkt_gate": 20,
+                "params": {**F0, "w": w, **kw}}
+
+    # 2026-11-19 第四轮R1/R2: 三因子单加(0.5/1.0档) vs v4基线
     VARIANTS = [
-        {"name": "v2.5复制·20日动量+MA10", "entry": "v25", "exit": "ma10"},
-        {"name": "R5·F0(ch2.0/r5.06/r20.45/m0.5)",
-         "entry": "v3", "exit": "chand", "mkt_gate": 20, "params": F0},
-        {"name": "R5·F0+ch1.75", "entry": "v3", "exit": "chand", "mkt_gate": 20,
-         "params": {**F0, "chand_k": 1.75}},
-        {"name": "R5·F0+ch2.25", "entry": "v3", "exit": "chand", "mkt_gate": 20,
-         "params": {**F0, "chand_k": 2.25}},
-        {"name": "R5·F0+r20.50", "entry": "v3", "exit": "chand", "mkt_gate": 20,
-         "params": {**F0, "r20_max": 0.50}},
-        {"name": "R5·F0+r5.07", "entry": "v3", "exit": "chand", "mkt_gate": 20,
-         "params": {**F0, "r5_max": 0.07}},
-        {"name": "R5·F0+mom0.6", "entry": "v3", "exit": "chand", "mkt_gate": 20,
-         "params": {**F0, "w": {"mom": 0.6, "rev": 1.0, "vol": 1.0, "pull": 0.5}}},
-        {"name": "R5·F0+pull0.75", "entry": "v3", "exit": "chand", "mkt_gate": 20,
-         "params": {**F0, "w": {"mom": 0.5, "rev": 1.0, "vol": 1.0, "pull": 0.75}}},
-        {"name": "R5·F0+vol1.5", "entry": "v3", "exit": "chand", "mkt_gate": 20,
-         "params": {**F0, "w": {"mom": 0.5, "rev": 1.0, "vol": 1.5, "pull": 0.5}}},
-        {"name": "R5·F0+冷却15", "entry": "v3", "exit": "chand", "mkt_gate": 20,
-         "cooldown": 15, "params": F0},
+        _v("F0基线(v4现行)"),
+        _v("R4·irank0.5", w={"irank": 0.5}),
+        _v("R4·irank1.0", w={"irank": 1.0}),
+        _v("R4·brank0.5", w={"brank": 0.5}),
+        _v("R4·brank1.0", w={"brank": 1.0}),
+        _v("R4·btier0.5", w={"btier": 0.5}),
+        _v("R4·btier1.0", w={"btier": 1.0}),
     ]
-    idx_ret = U[IDX]["closes"][-1] / U[IDX]["closes"][WARM] - 1
+    # R3参数扰动: 权重0.25/0.75档 + btier_hot阈值8%/12%/15% + 因子组合
+    if args.perturb:
+        VARIANTS = [
+            _v("F0基线(v4现行)"),
+            _v("R4·irank0.25", w={"irank": 0.25}),
+            _v("R4·irank0.75", w={"irank": 0.75}),
+            _v("R4·brank0.25", w={"brank": 0.25}),
+            _v("R4·brank0.75", w={"brank": 0.75}),
+            _v("R4·btier0.25", w={"btier": 0.25}),
+            _v("R4·btier0.75", w={"btier": 0.75}),
+            _v("R4·btier0.5·hot8%", w={"btier": 0.5}, btier_hot=0.08),
+            _v("R4·btier0.5·hot12%", w={"btier": 0.5}, btier_hot=0.12),
+            _v("R4·btier0.5·hot15%", w={"btier": 0.5}, btier_hot=0.15),
+            _v("R4·i0.5+b0.5", w={"irank": 0.5, "brank": 0.5}),
+            _v("R4·i0.5+t0.5", w={"irank": 0.5, "btier": 0.5}),
+            _v("R4·b0.5+t0.5", w={"brank": 0.5, "btier": 0.5}),
+            _v("R4·i0.5+b0.5+t0.5", w={"irank": 0.5, "brank": 0.5, "btier": 0.5}),
+        ]
+    idx_ret = U[IDX]["closes"][-1] / U[IDX]["closes"][t0] - 1
     ew = []
     for c, st in U.items():
         if c == IDX:
             continue
-        j0 = max((st["dmap"].get(d, -1) for d in cal[WARM:WARM + 5]), default=-1)
+        j0 = max((st["dmap"].get(d, -1) for d in cal[t0:t0 + 5]), default=-1)
         if j0 and j0 > 0 and st["closes"][-1] > 0:
             ew.append(st["closes"][-1] / st["closes"][j0] - 1)
     print(f"[基准] 上证指数 {idx_ret * 100:+.2f}% | 宇宙等权 "

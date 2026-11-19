@@ -69,10 +69,12 @@ base = {"board_kind_cn": "行业", "board_name": "银行",
         "res1": 5.80, "res2": None, "sup1": 5.40, "sup2": 5.10,
         "pct_chg": 0.012}
 ent1 = dict(base, code="601398", name="邮储银行", score=1.70, close=5.63,
-            bias=0.04, vr=1.25, first_date="2026-11-18", first_close=5.50)
+            bias=0.04, vr=1.25, first_date="2026-11-18", first_close=5.50,
+            brank=0.78, z_brank=1.2)
 ent2 = dict(base, code="600036", name="招商银行", score=3.06, close=45.20,
             bias=0.12, vr=0.90, first_date="2026-11-10", first_close=42.00,
-            res1=44.50, res2=46.00, sup1=41.00, sup2=40.00, pct_chg=-0.005)
+            res1=44.50, res2=46.00, sup1=41.00, sup2=40.00, pct_chg=-0.005,
+            brank=0.31, z_brank=-0.6)
 obs = ([ent1, ent2], [ent1, ent2], False, {})
 menv = {"idx": {"close": 3350.0, "ma20": 3360.0}}  # 模拟门控关闭
 out = engine._pool_section(obs, state, cal, "2026-11-19", menv=menv)
@@ -81,7 +83,10 @@ assert "入仓时机(v5·信息层)" in out
 assert "[大盘门控关闭" in out          # 门控前缀
 assert "邮储银行" in out and "招商银行" in out
 assert "回踩确认" in out               # 当日情况档位
-print("4) _pool_section v5渲染 ✓(当日情况/支撑压力/入池涨跌/时机节/门控前缀)")
+assert "行业z" in out                  # v5打分: 六因子主表列
+assert "行业分位" in out               # v5打分: 打分卡brank行
+assert "78%" in out                   # brank原始值渲染
+print("4) _pool_section v5渲染 ✓(当日情况/支撑压力/入池涨跌/行业z/打分卡行业分位)")
 
 # ---- 5) 回退开关验证: PICK_V5_EN=False 回纯v4展示 ----
 import config_quant as config  # noqa: E402
@@ -92,4 +97,39 @@ assert "[回踩确认]" in out_v4          # v4归档口径: 位置标签挂回�
 assert "入池" in out_v4
 config.PICK_V5_EN = True
 print("5) V5开关回退 ✓(False=纯v4展示, 位置标签回名称)")
+
+# ---- 6) _zscore_v5单元: 继承v4内核+z_brank+六因子score ----
+from quant import picker  # noqa: E402
+
+cands = [{"code": "A", "m120": 0.20, "mom20": 0.05, "vol20": 0.020,
+          "bias": 0.03, "vr": 1.20, "brank": 0.9},
+         {"code": "B", "m120": 0.10, "mom20": 0.10, "vol20": 0.030,
+          "bias": 0.06, "vr": 1.00, "brank": 0.5},
+         {"code": "C", "m120": 0.15, "mom20": 0.02, "vol20": 0.025,
+          "bias": 0.01, "vr": 0.90, "brank": None}]
+extra = [{"code": "D", "m120": 0.12, "mom20": 0.04, "vol20": 0.020,
+          "bias": 0.02, "vr": 1.10, "brank": 0.1}]
+picker._zscore_v5(cands, extra)
+# z_brank截面: cands brank=[0.9,0.5] -> mu=0.7, sd=0.2
+assert abs(cands[0]["z_brank"] - 1.0) < 1e-9
+assert abs(cands[1]["z_brank"] + 1.0) < 1e-9
+assert cands[2]["z_brank"] == 0.0          # brank缺失 -> z=0中性
+assert abs(extra[0]["z_brank"] + 3.0) < 1e-9   # extra共用cands截面mu/sd
+for c in cands:
+    v5s = (config.PICK_V5_W["mom"] * c["z_m120"] + config.PICK_V5_W["rev"] * c["z_mom20"]
+           + config.PICK_V5_W["vol"] * c["z_vol20"] + config.PICK_V5_W["pull"] * c["z_bias"]
+           + config.PICK_V5_W["vr"] * c["z_vr"] + config.PICK_V5_W["brank"] * c["z_brank"])
+    assert abs(c["score"] - v5s) < 1e-9, "score=v4内核五项+brank"
+assert abs(cands[2]["score"] - (0.5 * cands[2]["z_m120"] + 1.0 * cands[2]["z_mom20"]
+                                + 1.0 * cands[2]["z_vol20"] + 0.5 * cands[2]["z_bias"]
+                                + 0.5 * cands[2]["z_vr"])) < 1e-9  # None中性=纯v4分
+print("6) _zscore_v5 ✓(继承v4内核, z_brank截面, extra同参, None中性)")
+
+# ---- 7) 打分开关回退: PICK_V5_SCORE_EN=False 回v4五因子 ----
+config.PICK_V5_SCORE_EN = False
+out_v4s = engine._pool_section(obs, state, cal, "2026-11-19", menv=menv)
+assert "行业z" not in out_v4s and "行业分位" not in out_v4s
+assert "当日情况" in out_v4s              # 估算层展示不受打分开关影响
+config.PICK_V5_SCORE_EN = True
+print("7) 打分开关回退 ✓(SCORE_EN=False=回v4五因子, 估算层展示保留)")
 print("\nALL_PASS")

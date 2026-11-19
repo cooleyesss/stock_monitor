@@ -375,6 +375,7 @@ def _pool_entry(p, rep_date):
             "z_m120": p.get("z_m120"), "z_mom20": p.get("z_mom20"),
             "z_vol20": p.get("z_vol20"), "z_bias": p.get("z_bias"),
             "z_vr": p.get("z_vr"),
+            "brank": p.get("brank"), "z_brank": p.get("z_brank"),
             "first_close": p["close"],          # v5: 入池首日收盘价(入池后涨跌基准)
             "res1": p.get("res1"), "res2": p.get("res2"),   # v5: 压力位/强压力
             "sup1": p.get("sup1"), "sup2": p.get("sup2"),   # v5: MA20支撑/强支撑
@@ -411,6 +412,8 @@ def _pool_upsert(state, passing, rep_date):
                       "z_vol20": p.get("z_vol20", e.get("z_vol20")),
                       "z_bias": p.get("z_bias", e.get("z_bias")),
                       "z_vr": p.get("z_vr", e.get("z_vr")),
+                      "brank": p.get("brank", e.get("brank")),
+                      "z_brank": p.get("z_brank", e.get("z_brank")),
                       "pct_chg": p.get("pct_chg", e.get("pct_chg")),
                       "res1": p.get("res1", e.get("res1")),
                       "res2": p.get("res2", e.get("res2")),
@@ -811,6 +814,8 @@ _V4_FACTS = (("m120", "中期动量", "mom", "{:+.0%}"),
              ("vol20", "低波动", "vol", "{:.1%}"),
              ("bias", "回踩位置", "pull", "{:+.1%}"),
              ("vr", "量比", "vr", "{:.2f}"))
+# v5六因子展示(2026-11-19 brank采纳): v4内核五因子原样 + 行业分位
+_V5_FACTS = _V4_FACTS + (("brank", "行业分位", "brank", "{:.0%}"),)
 
 
 def _zbar_html(z, half=30, vmax=2.5, h=9):
@@ -854,10 +859,12 @@ def _v4_pos_tag(e):
 
 def _scorecard(e):
     """单候选逐因子打分明细表(仿图片'候选评分总览'):
-    原始值 + z分图形条 + 截面z分 + 权重 + 贡献分, 合计=综合分"""
-    w = config.PICK_V3_W
+    原始值 + z分图形条 + 截面z分 + 权重 + 贡献分, 合计=综合分
+    v5打分开启时六因子(+行业分位brank), 否则v4五因子(归档口径)"""
+    v5s = config.PICK_V5_EN and config.PICK_V5_SCORE_EN
+    w = config.PICK_V5_W if v5s else config.PICK_V3_W
     rows = []
-    for fk, fn, wk, fmt in _V4_FACTS:
+    for fk, fn, wk, fmt in (_V5_FACTS if v5s else _V4_FACTS):
         raw, z = e.get(fk), e.get("z_" + fk)
         raw_txt = fmt.format(raw) if raw is not None else "-"
         wt = w.get(wk, 0.0)
@@ -882,6 +889,7 @@ def _pool_section(obs, state, cal, rep_date, menv=None):
     PICK_V5_EN=False时回纯v4展示口径(位置标签挂名称, 无价位/时机)"""
     snap, obs_best, zt_on = obs[0], obs[1], obs[2]
     v5 = config.PICK_V5_EN
+    v5s = v5 and config.PICK_V5_SCORE_EN   # v5打分(brank第六因子)开启
     gate_open = True                       # v5门控状态(从menv大盘快照推, 缺失fail-open)
     if v5 and config.PICK_V3_EN and config.PICK_V3_GATE_MA and menv:
         ix = menv.get("idx") or {}
@@ -914,8 +922,9 @@ def _pool_section(obs, state, cal, rep_date, menv=None):
         r = [nm, e.get("board_disp")
              or f"{e['board_kind_cn']}·{e['board_name']}", sc]
         if v3:
-            r += [_zcell(e.get("z_" + k))
-                  for k in ("m120", "mom20", "vol20", "bias", "vr")]
+            r += [_zcell(e.get("z_" + k)) for k in
+                  (("m120", "mom20", "vol20", "bias", "vr", "brank") if v5s
+                   else ("m120", "mom20", "vol20", "bias", "vr"))]
         r += [f"{e['close']:.3f}"]
         if v5:
             # 当日情况列(仿图片位置列): 位置档位+当日涨跌+量能状态
@@ -950,6 +959,9 @@ def _pool_section(obs, state, cal, rep_date, menv=None):
         r += [str(e["hits"])]
         rows.append(r)
     heads = (["候选(按多因子分)", "所属板块", "综合分", "动量z", "反转z", "低波z",
+              "回踩z", "量比z", "行业z", "现价", "当日情况", "支撑/压力", "入池涨跌",
+              "上榜"] if v3 and v5 and v5s else
+             ["候选(按多因子分)", "所属板块", "综合分", "动量z", "反转z", "低波z",
               "回踩z", "量比z", "现价", "当日情况", "支撑/压力", "入池涨跌", "上榜"]
              if v3 and v5 else
              ["候选(按多因子分)", "所属板块", "综合分", "动量z", "反转z", "低波z",
@@ -984,18 +996,34 @@ def _pool_section(obs, state, cal, rep_date, menv=None):
                 if plan:
                     body += notify.colored(f"入仓时机(v5·信息层): {plan}",
                                            config.C_ORANGE)
-        _w = config.PICK_V3_W
-        body += notify.colored(
-            "评分口径: v4多因子分=Σ(权重×截面z分), 权重 中期动量"
-            f"{_w['mom']:g}/短期反转{_w['rev']:g}/低波动{_w['vol']:g}/"
-            f"回踩位置{_w['pull']:g}/量比{_w.get('vr', 0):g}"
-            "(2026-11-18图片策略融合定版); 评分图形=截面z分"
-            "(中心线左负右红正, ±2.5截断); 极端标的沉底, 只认当日扫描快照; "
-            f"保鲜期{config.PICK_POOL_KEEP}个交易日, 超龄自动出池"
-            + ("; v5估算层: 当日情况=位置档位+涨跌+量能(vr≥1.1放量/<0.85缩量), "
-               "支撑=MA20/压力=20日高, 入池涨跌=入池首日收盘→最近刷新日收盘, "
-               "入仓时机为信息层建议·不参与自动决策"
-               if v5 else ""), config.C_GRAY)
+        if v5s:
+            _w = config.PICK_V5_W
+            body += notify.colored(
+                "评分口径: v5六因子分=Σ(权重×截面z分)=v4内核五因子+行业分位, "
+                f"权重 中期动量{_w['mom']:g}/短期反转{_w['rev']:g}/"
+                f"低波动{_w['vol']:g}/回踩位置{_w['pull']:g}/量比{_w['vr']:g}/"
+                f"行业分位{_w['brank']:g}"
+                "(brank=板块20日动量均值在全市场板块中的分位, 2026-11-19采纳)"
+                "; 评分图形=截面z分(中心线左负右红正, ±2.5截断); "
+                "极端标的沉底, 只认当日扫描快照; "
+                f"保鲜期{config.PICK_POOL_KEEP}个交易日, 超龄自动出池"
+                + ("; v5估算层: 当日情况=位置档位+涨跌+量能(vr≥1.1放量/<0.85缩量), "
+                   "支撑=MA20/压力=20日高, 入池涨跌=入池首日收盘→最近刷新日收盘, "
+                   "入仓时机为信息层建议·不参与自动决策"
+                   if v5 else ""), config.C_GRAY)
+        else:
+            _w = config.PICK_V3_W
+            body += notify.colored(
+                "评分口径: v4多因子分=Σ(权重×截面z分), 权重 中期动量"
+                f"{_w['mom']:g}/短期反转{_w['rev']:g}/低波动{_w['vol']:g}/"
+                f"回踩位置{_w['pull']:g}/量比{_w.get('vr', 0):g}"
+                "(2026-11-18图片策略融合定版); 评分图形=截面z分"
+                "(中心线左负右红正, ±2.5截断); 极端标的沉底, 只认当日扫描快照; "
+                f"保鲜期{config.PICK_POOL_KEEP}个交易日, 超龄自动出池"
+                + ("; v5估算层: 当日情况=位置档位+涨跌+量能(vr≥1.1放量/<0.85缩量), "
+                   "支撑=MA20/压力=20日高, 入池涨跌=入池首日收盘→最近刷新日收盘, "
+                   "入仓时机为信息层建议·不参与自动决策"
+                   if v5 else ""), config.C_GRAY)
     else:
         body += notify.colored(
             f"排序口径: {'连板行情(妖股/连板股优先)' if zt_on else '非连板行情(极端标的沉底)'}, "
@@ -1272,16 +1300,24 @@ def build_report(state, fills, last_closes, rep_date, sel=None, stale=None, plan
         body += _mkt_env_section(menv)
     body += (notify.sec("口径")
              + notify.colored(
-                 ("v4多因子机构路线(2026-11-18图片策略融合定版, bt_quant_v3.py三轮回测: "
-                  "全窗口286日+169%/MDD-11.6%/胜率46.7%, 半年熊市窗口+20.7%不败) | "
-                  "选股=全市场行业板成分股, 门槛'趋势内回调'(收盘>MA20/60且MA20上行, 120日跳段动量≥0, "
-                  "乖离≤15%, 5日≤6%, 20日≤45%), 五因子z-score打分(0.5中期动量+1短期反转+1低波+0.5回踩"
-                  "乖离+0.5量比)取TopK | 退出=阶梯止盈+阶梯止损+吊灯止损(22日最高收盘-2×ATR14)先到先卖, "
-                  "空仓不自动重入(入场只走调仓日选股挂单; 特别好机会可忽略调仓日与冷却期临时建仓) | "
-                  "大盘门控: 上证收盘<MA20暂停新开仓 | "
-                  + ("v5估算层(2026-11-19): 压力/支撑位+回踩确认档+入仓时机为信息层, "
-                     "不参与自动决策, 时机=支撑MA20上方企稳低吸/放量突破压力跟随 | "
-                     if config.PICK_V5_EN else ""))
+                 ((config.PICK_V5_EN and config.PICK_V5_SCORE_EN)
+                  and "v5六因子机构路线(2026-11-19 brank采纳: v4内核五因子+0.5行业分位, "
+                      "半年窗口brank全档稳健+27~32%/MDD改善; 归档v4管线零改动) | "
+                  or "v4多因子机构路线(2026-11-18图片策略融合定版, bt_quant_v3.py三轮回测: "
+                      "全窗口286日+169%/MDD-11.6%/胜率46.7%, 半年熊市窗口+20.7%不败) | ")
+                 + ("选股=全市场行业板成分股, 门槛'趋势内回调'(收盘>MA20/60且MA20上行, 120日跳段动量≥0, "
+                     "乖离≤15%, 5日≤6%, 20日≤45%), "
+                    + (config.PICK_V5_EN and config.PICK_V5_SCORE_EN
+                       and "六因子z-score打分(0.5中期动量+1短期反转+1低波+0.5回踩"
+                           "乖离+0.5量比+0.5行业分位brank)取TopK | "
+                       or "五因子z-score打分(0.5中期动量+1短期反转+1低波+0.5回踩"
+                           "乖离+0.5量比)取TopK | ")
+                    + "退出=阶梯止盈+阶梯止损+吊灯止损(22日最高收盘-2×ATR14)先到先卖, "
+                    "空仓不自动重入(入场只走调仓日选股挂单; 特别好机会可忽略调仓日与冷却期临时建仓) | "
+                    "大盘门控: 上证收盘<MA20暂停新开仓 | "
+                    + ("v5估算层(2026-11-19): 压力/支撑位+回踩确认档+入仓时机为信息层, "
+                       "不参与自动决策, 时机=支撑MA20上方企稳低吸/放量突破压力跟随 | "
+                       if config.PICK_V5_EN else ""))
                  if config.PICK_V3_EN else
                  ("v2.5双模策略 | 每股独立子账户, 趋势腿满仓买入, 阶梯止盈(浮盈<15%带宽6%/"
                   "15~30%带10%/≥30%带15%)+阶梯止损(浮盈<25%线-12%/25~50%线+3%/≥50%线+10%)+MA10破位"

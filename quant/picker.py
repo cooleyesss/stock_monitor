@@ -505,6 +505,23 @@ def _zscore_v3(cands, extra=()):
                       + w.get("vr", 0.0) * c["z_vr"])
 
 
+def _zscore_v5(cands, extra=()):
+    """v5打分(2026-11-19 brank采纳): 继承v4内核(_zscore_v3原样调用不动) +
+    行业分位brank第六因子; PICK_V5_W六因子加权; brank缺失记z=0中性(回测同口径)
+    半年窗口回测: 基线+20.7% -> +27.0%(brank0.5), 全档0.25~1.0均稳健跑赢且MDD改善"""
+    _zscore_v3(cands, extra)               # 归档v4内核: 五因子z+score(随后覆盖)
+    w = config.PICK_V5_W
+    xs = [c["brank"] for c in cands if c.get("brank") is not None]
+    mu = sum(xs) / len(xs) if xs else 0.0
+    sd = (sum((x - mu) ** 2 for x in xs) / len(xs)) ** 0.5 if xs else 0.0
+    for c in list(cands) + list(extra):        # extra共用同一截面参数
+        v = c.get("brank")
+        c["z_brank"] = (v - mu) / sd if v is not None and sd > 0 else 0.0
+        c["score"] = (w["mom"] * c["z_m120"] + w["rev"] * c["z_mom20"]
+                      + w["vol"] * c["z_vol20"] + w["pull"] * c["z_bias"]
+                      + w["vr"] * c["z_vr"] + w["brank"] * c["z_brank"])
+
+
 def _v3_extreme(code, bars, mom20, r5):
     """v3极端标记(与bt_quant_v3.snap逐句同口径): 近10日涨停>=3 或
     20日涨幅>=100% 或 5日涨幅>=30% (独立于PICK_EXTREME_EN, v3始终计算)"""
@@ -524,7 +541,7 @@ def _v3_reason(p, rank, n):
     else:
         names = {"z_m120": "中期动量强", "z_mom20": "短期回调充分",
                  "z_vol20": "波动低", "z_bias": "贴近MA20回踩位",
-                 "z_vr": "量比放大"}
+                 "z_vr": "量比放大", "z_brank": "行业居前"}
         hl = sorted(((v, names[k]) for k, v in p.items() if k in names),
                     key=lambda kv: -kv[0])
         tops = "/".join(k for _, k in hl[:2])
@@ -579,6 +596,8 @@ def _select_v3(held, cool_dates, topk, deadline):
                           "board_mom": 0.0})   # v3无板块动量概念(兼容展示字段)
     res["cand_n"] = len(cands)
 
+    v5s = config.PICK_V5_EN and config.PICK_V5_SCORE_EN   # v5打分(brank)开关
+    bm_acc = {}                             # v5: 板块->mom20列表(硬过滤后全口径, 同bt)
     passing = []
     for c in cands:
         if time.time() > deadline:
@@ -595,6 +614,9 @@ def _select_v3(held, cool_dates, topk, deadline):
         if why:
             skip[why] += 1
             continue
+        if v5s and len(bars) >= 21 and bars[-21]["close"] > 0:
+            bm_acc.setdefault(c["board_bk"], []).append(
+                bars[-1]["close"] / bars[-21]["close"] - 1)
         ok, why2, f = _v3_factors(bars)
         if not ok:
             skip[why2] += 1
@@ -604,6 +626,16 @@ def _select_v3(held, cool_dates, topk, deadline):
         if config.PICK_V5_EN:                 # v5估算层价位快照(信息层, 不参与打分)
             p.update(estim.snapshot(bars))
         passing.append(p)
+    if v5s and bm_acc:
+        # brank行业分位(与bt_quant_v3同口径): 板块mom20均值(成员>=3)在全市场
+        # 有效板块中的分位; 板块无效/成员不足记None -> z=0中性
+        bmean = {b: sum(v) / len(v) for b, v in bm_acc.items()
+                 if len(v) >= config.PICK_V5_BRANK_MIN_MEMBERS}
+        bmv = sorted(bmean.values())
+        for p in passing:
+            bm = bmean.get(p["board_bk"])
+            p["brank"] = (sum(1 for v in bmv if v < bm) / (len(bmv) - 1)
+                          if bm is not None and len(bmv) > 1 else None)
     # 打分口径与回测一致: 先剔除持仓/冷却, 再对剩余候选做截面z-score
     # (2026-11-10好机会豁免: 冷却候选收集为extra, 套用elig同一截面参数补算分数,
     #  供engine判定"特别好机会"能否豁免冷却期; picks仍只出自elig, 回测口径不变)
@@ -617,7 +649,10 @@ def _select_v3(held, cool_dates, topk, deadline):
             continue
         elig.append(p)
     if elig:
-        _zscore_v3(elig, cooled)
+        if v5s:
+            _zscore_v5(elig, cooled)     # v5六因子(继承v4内核+brank)
+        else:
+            _zscore_v3(elig, cooled)     # 归档v4五因子(零改动)
         elig.sort(key=lambda x: (x["extreme"], -x["score"]))
     passing.sort(key=lambda x: (x.get("extreme", False),
                                 -(x["score"] if x.get("score") is not None else -1e9)))
