@@ -636,6 +636,9 @@ def main():
                     help="模拟窗口交易日数(0=全窗口, 默认=SIM_DAYS现行120)")
     ap.add_argument("--perturb", action="store_true",
                    help="R3参数扰动变体集(权重档+btier阈值+组合)")
+    ap.add_argument("--scan", action="store_true",
+                    help="R5全参数扫描: 图片全因子(bd/act/pos/cpos/lsb/lbm/"
+                         "irank/btier)+brank权重档+策略参数(chand/r5/r20)+btier阈值")
     args = ap.parse_args()
     global SIM_DAYS
     if args.days is not None:
@@ -653,43 +656,67 @@ def main():
     print(f"[行情] 就绪 {len(U)} 只(含指数), 交易日 {len(cal)} 根, "
           f"模拟窗口 {cal[t0]} ~ {cal[-1]} ({len(cal) - t0}日)")
 
-    # 基线=v4现行五因子(mom0.5/rev1/vol1/pull0.5/vr0.5, chand2.0, 5日6%/20日45%)
+    # 基线=v5现行六因子(2026-11-19 brank采纳: v4内核五因子+行业分位0.5)
     F0 = {"chand_k": 2.0, "r5_max": 0.06, "r20_max": 0.45,
-          "w": {"mom": 0.5, "rev": 1.0, "vol": 1.0, "pull": 0.5, "vr": 0.5}}
+          "w": {"mom": 0.5, "rev": 1.0, "vol": 1.0, "pull": 0.5, "vr": 0.5,
+                "brank": 0.5}}
 
     def _v(nm, **kw):
         w = dict(F0["w"])
         w.update(kw.pop("w", {}))
-        return {"name": nm, "entry": "v3", "exit": "chand", "mkt_gate": 20,
-                "params": {**F0, "w": w, **kw}}
+        cd = kw.pop("cd", None)
+        V = {"name": nm, "entry": "v3", "exit": "chand",
+             "mkt_gate": kw.pop("gate", 20), "params": {**F0, "w": w, **kw}}
+        if cd is not None:
+            V["cooldown"] = cd            # 缺省回落Q.PICK_COOLDOWN
+        return V
 
-    # 2026-11-19 第四轮R1/R2: 三因子单加(0.5/1.0档) vs v4基线
+    # 2026-11-19 第四轮R1/R2: 三因子单加(0.5/1.0档) vs v4基线(已完成, 结论留档)
     VARIANTS = [
-        _v("F0基线(v4现行)"),
-        _v("R4·irank0.5", w={"irank": 0.5}),
-        _v("R4·irank1.0", w={"irank": 1.0}),
-        _v("R4·brank0.5", w={"brank": 0.5}),
-        _v("R4·brank1.0", w={"brank": 1.0}),
-        _v("R4·btier0.5", w={"btier": 0.5}),
-        _v("R4·btier1.0", w={"btier": 1.0}),
+        _v("F0基线(v5现行)"),
+        _v("S·irank0.5", w={"irank": 0.5}),
+        _v("S·brank0.25", w={"brank": 0.25}),
+        _v("S·btier0.5", w={"btier": 0.5}),
     ]
     # R3参数扰动: 权重0.25/0.75档 + btier_hot阈值8%/12%/15% + 因子组合
     if args.perturb:
+        # R5轮C(2026-11-19, 多周期对比): 轮B赢家=chand降档(30日窗口chand1.0~1.5
+        # 均-6.30% vs 基线-8.28%, 门槛/冷却不分化; gate_off=-14.5%门控证伪)
+        # -> chand梯度+gate_off在120日/全窗口复验, 与30日结果合并出三周期对比表
         VARIANTS = [
-            _v("F0基线(v4现行)"),
-            _v("R4·irank0.25", w={"irank": 0.25}),
-            _v("R4·irank0.75", w={"irank": 0.75}),
-            _v("R4·brank0.25", w={"brank": 0.25}),
-            _v("R4·brank0.75", w={"brank": 0.75}),
-            _v("R4·btier0.25", w={"btier": 0.25}),
-            _v("R4·btier0.75", w={"btier": 0.75}),
-            _v("R4·btier0.5·hot8%", w={"btier": 0.5}, btier_hot=0.08),
-            _v("R4·btier0.5·hot12%", w={"btier": 0.5}, btier_hot=0.12),
-            _v("R4·btier0.5·hot15%", w={"btier": 0.5}, btier_hot=0.15),
-            _v("R4·i0.5+b0.5", w={"irank": 0.5, "brank": 0.5}),
-            _v("R4·i0.5+t0.5", w={"irank": 0.5, "btier": 0.5}),
-            _v("R4·b0.5+t0.5", w={"brank": 0.5, "btier": 0.5}),
-            _v("R4·i0.5+b0.5+t0.5", w={"irank": 0.5, "brank": 0.5, "btier": 0.5}),
+            _v("F0基线(v5现行)"),
+            _v("C·chand1.0", chand_k=1.0),
+            _v("C·chand1.25", chand_k=1.25),
+            _v("C·chand1.5", chand_k=1.5),
+            _v("C·chand1.75", chand_k=1.75),
+            _v("C·gate_off", gate=0),
+        ]
+    # R5全参数扫描(2026-11-19用户指令: 30日窗口+全参数迭代+多周期对比):
+    # 图片全因子单加0.5(含此前否决的bd/act/pos/cpos/lsb/lbm) + brank权重档
+    # + 策略参数(吊灯系数/5日/20日涨幅上限) + btier过热阈值
+    elif args.scan:
+        VARIANTS = [
+            _v("F0基线(v5现行)"),
+            _v("S·bd0.5", w={"bd": 0.5}),
+            _v("S·act0.5", w={"act": 0.5}),
+            _v("S·pos0.5", w={"pos": 0.5}),
+            _v("S·cpos0.5", w={"cpos": 0.5}),
+            _v("S·lsb0.5", w={"lsb": 0.5}),
+            _v("S·lbm0.5", w={"lbm": 0.5}),
+            _v("S·irank0.5", w={"irank": 0.5}),
+            _v("S·btier0.5", w={"btier": 0.5}),
+            _v("S·brank0.25", w={"brank": 0.25}),
+            _v("S·brank0.75", w={"brank": 0.75}),
+            _v("S·brank1.0", w={"brank": 1.0}),
+            _v("S·chand1.5", chand_k=1.5),
+            _v("S·chand2.5", chand_k=2.5),
+            _v("S·r5max4%", r5_max=0.04),
+            _v("S·r5max8%", r5_max=0.08),
+            _v("S·r20max35%", r20_max=0.35),
+            _v("S·r20max55%", r20_max=0.55),
+            _v("S·btier0.5·hot8%", w={"btier": 0.5}, btier_hot=0.08),
+            _v("S·btier0.5·hot12%", w={"btier": 0.5}, btier_hot=0.12),
+            _v("S·btier0.5·hot15%", w={"btier": 0.5}, btier_hot=0.15),
         ]
     idx_ret = U[IDX]["closes"][-1] / U[IDX]["closes"][t0] - 1
     ew = []
