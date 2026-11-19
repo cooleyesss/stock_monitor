@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""东方财富实时行情 + K线MACD (多节点容错)"""
+"""东方财富实时行情 + K线MACD (多级容错: 东财 -> 腾讯 -> 新浪)"""
 import datetime
 import json
 import os
@@ -67,7 +67,52 @@ def fetch_quotes(codes):
             last_err = e
             time.sleep(1)
             continue
+    # 东财全部节点失败 -> 新浪批量兜底(2026-11-19)
+    try:
+        qs = _fetch_quotes_sina(codes)
+        if qs:
+            print(f"[行情] 东财实时节点均失败, 新浪兜底{len(qs)}只")
+            return qs
+    except Exception as e:
+        last_err = last_err or e
     raise last_err if last_err else RuntimeError("所有行情节点均失败")
+
+
+def _fetch_quotes_sina(codes):
+    """新浪实时行情兜底(东财全部节点故障时): hq.sinajs.cn批量(必须带Referer头, GBK)
+    无量比字段(vr=None由调用方按东财停牌口径处理); 涨跌幅按昨收推算; ts转epoch对齐f124
+    代码映射与腾讯同构(999999->sh000001); 返回 {code: {name,price,pct,vr,ts}}"""
+    pairs = [(c, _tx_code(c)) for c in codes]
+    pairs = [(c, s) for c, s in pairs if s]
+    rev = {s: c for c, s in pairs}                      # sh600036 -> 原始code(含999999别名)
+    out = {}
+    for i in range(0, len(pairs), config.SINA_HQ_BATCH):
+        batch = [s for _, s in pairs[i:i + config.SINA_HQ_BATCH]]
+        r = requests.get(config.SINA_HQ_HOST + "/list=" + ",".join(batch),
+                         timeout=10, headers={"User-Agent": "Mozilla/5.0",
+                                             "Referer": "https://finance.sina.com.cn"})
+        r.encoding = "gbk"
+        for ln in r.text.splitlines():
+            try:
+                head, body = ln.split('="', 1)
+                sym = head.split("hq_str_", 1)[1].strip()
+                code = rev.get(sym)
+                f = body.rstrip('";\r').split(",")
+                if not code or len(f) < 32:
+                    continue
+                price = float(f[3])
+                prev = float(f[2])
+                if price <= 0 or prev <= 0:             # 停牌/无数据
+                    continue
+                ts = int(time.mktime(time.strptime(f"{f[30]} {f[31]}", "%Y-%m-%d %H:%M:%S")))
+                out[code] = {"name": f[0], "price": price,
+                             "pct": round((price / prev - 1) * 100, 2),
+                             "vr": None, "ts": ts}
+            except (IndexError, ValueError, KeyError):
+                continue
+    if not out:
+        raise RuntimeError("新浪实时行情为空")
+    return out
 
 
 def fetch_kline_closes(code, klt=None, lmt=120):
@@ -195,9 +240,55 @@ def _fetch_kline_bars_tx(code, klt, lmt):
     raise last_err if last_err else RuntimeError("腾讯K线节点均失败")
 
 
+_SINA_KIND = {"101": 240, "1": 1, "5": 5, "15": 15, "30": 30, "60": 60}   # klt -> 新浪scale(分钟)
+
+
+def _fetch_kline_bars_sina(code, klt, lmt):
+    """新浪K线(第三级兜底: 东财/腾讯均故障时, 2026-11-19)
+    代码映射与腾讯同构(复用_tx_code); 日K为不复权原始价(东财fqt=1/腾讯qfq为前复权,
+    除权日口径会漂移, k180合并的重叠校验会检测并整段重建自愈); 成交量单位为股,
+    /100转手对齐东财/腾讯; 分钟K自带成交额, 日K无额按量价近似(与腾讯回退同法)
+    注意: 日K不含当日盘中形成bar(腾讯含), 盘中降级时末根为上一交易日完整bar
+    返回格式与东财一致: {dt,open,close,high,low,vol,amount}"""
+    sc = _tx_code(code)
+    if sc is None:
+        raise RuntimeError("新浪源不支持该标的(板块指数仅东财提供)")
+    scale = _SINA_KIND.get(str(klt))
+    if scale is None:
+        raise RuntimeError(f"新浪源不支持klt={klt}")
+    try:
+        r = requests.get(config.SINA_KLINE_URL,
+                         params={"symbol": sc, "scale": scale, "ma": "no",
+                                 "datalen": int(lmt)},
+                         timeout=10, headers={"User-Agent": "Mozilla/5.0",
+                                              "Referer": "https://finance.sina.com.cn"})
+        rows = r.json()
+        bars = []
+        for row in rows:
+            try:
+                o, c = float(row["open"]), float(row["close"])
+                h, l = float(row["high"]), float(row["low"])
+                v = float(row["volume"]) / 100.0            # 股 -> 手
+                a = float(row.get("amount") or 0) or round(v * 100 * (h + l + c) / 3, 2)
+            except (ValueError, KeyError, TypeError):
+                continue
+            dt = str(row.get("day", ""))
+            if scale < 240:                                 # 分钟K 'YYYY-MM-DD HH:MM:SS'
+                dt = dt[:16]
+            bars.append({"dt": dt, "open": o, "close": c, "high": h, "low": l,
+                         "vol": v, "amount": a})
+        if not bars:
+            raise RuntimeError("新浪K线为空")
+        return bars
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"新浪K线请求失败: {e}")
+
+
 def _fetch_kline_raw(code, klt, lmt, beg=None):
-    """真实网络拉取(东财优先 -> 熔断后腾讯回退), 无缓存
-    beg: 仅日K增量使用(东财按区间取数); 腾讯不支持区间, 按lmt取最近N根"""
+    """真实网络拉取(东财优先 -> 腾讯回退 -> 新浪兜底), 无缓存
+    beg: 仅日K增量使用(东财按区间取数); 腾讯/新浪不支持区间, 按lmt取最近N根"""
     if time.time() >= _EM_STATE[1]:
         rounds = 1 if _EM_STATE[0] >= config.EM_FAIL_BREAK else config.KLINE_RETRY
         try:
@@ -211,7 +302,11 @@ def _fetch_kline_raw(code, klt, lmt, beg=None):
                 print(f"[行情] 东财K线连续失败{_EM_STATE[0]}次, 熔断{config.EM_DOWN_SEC}秒改用腾讯源")
             else:
                 print(f"[行情] 东财K线失败({e}), 改用腾讯源")
-    return _fetch_kline_bars_tx(code, klt, lmt)
+    try:
+        return _fetch_kline_bars_tx(code, klt, lmt)
+    except Exception as e:
+        print(f"[行情] 腾讯K线失败({e}), 改用新浪源")
+        return _fetch_kline_bars_sina(code, klt, lmt)
 
 
 def fetch_kline_bars(code, klt=None, lmt=None):
@@ -444,6 +539,14 @@ def get_index_quote():
         except Exception as e:
             last_err = e
             continue
+    # 东财全部节点失败 -> 新浪兜底(sh000001指数别名同样支持, 2026-11-19)
+    try:
+        qs = _fetch_quotes_sina([config.REGIME_INDEX_ALIAS])
+        if qs.get(config.REGIME_INDEX_ALIAS):
+            _INDEX_QUOTE[0], _INDEX_QUOTE[1] = now, qs[config.REGIME_INDEX_ALIAS]
+            return qs[config.REGIME_INDEX_ALIAS]
+    except Exception:
+        pass
     print("指数行情获取失败", last_err)
     return _INDEX_QUOTE[1]
 

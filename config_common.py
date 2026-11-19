@@ -125,6 +125,11 @@ TX_KLINE_HOSTS = [                        # 日K多节点轮询(2026-11-04: 主�
     "https://web.ifzq.gtimg.cn",
 ]
 TX_MKLINE_HOST = "https://ifzq.gtimg.cn"      # 分钟K: /appstock/app/kline/mkline
+# 新浪财经第三级兜底(2026-11-19: 东财+腾讯同时故障时启用)
+# K线: json_v2端点(日K不复权/量为股÷100转手, 分钟K自带额); 实时: hq.sinajs.cn批量(必须带Referer头)
+SINA_KLINE_URL = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
+SINA_HQ_HOST = "https://hq.sinajs.cn"         # 实时: /list=sh600036,sz000001(GBK编码)
+SINA_HQ_BATCH = 60                            # 实时批量每请求标的数上限(防URL过长)
 EM_FAIL_BREAK = 3           # 东财K线连续失败N次 -> 本进程内熔断, 直接走腾讯(避免每次白等6秒)
 EM_DOWN_SEC = 900           # 熔断静默秒数(到期后再探一次东财; 探测只给1轮, 失败立即续熔断)
 # 板块/全市场列表(clist)节点: 实测仅 http 协议可用(https 被拒 RemoteDisconnected)
