@@ -16,7 +16,6 @@ from ttrade import config_ttrade as config
 from common import quotes
 from core.indicators import build_ind
 from ttrade import account
-from ttrade import vote
 
 KLT_DAILY, BARS_LMT = 101, 120
 DASH_PATH = os.path.join(config.REPORT_DIR, "ttrade", "dashboard_ttrade.html")
@@ -159,49 +158,36 @@ def _today_t(state, px, ops):
                   "fee": fee, "net": gross - fee}, info
 
 
-def _stats(state, px):
-    """策略归因统计(启发式, 与收盘战报完全同口径)"""
-    trades = state["today_trades"]
-    s_pairs, s_opens = account.fifo_pairs(trades)
-    lp = dict(px)
-    lpm = state.get("last_prices") or {}
-    for k, v in lpm.items():
-        lp.setdefault(k, v)
-    SKEYS = list(vote.VOTER_LABEL.keys()) + ["none"]   # 从投票器字典构建, 防新增投票器漏key致KeyError
-    SLBL = dict(vote.VOTER_LABEL)
-    SLBL["none"] = "无归因/旧策略"
-    LBL2KEY = {v: k for k, v in SLBL.items()}
-    st = {k: {"trig": 0, "exec": 0, "wait": 0, "realized": 0.0,
-              "floating": 0.0, "win": 0, "pair": 0} for k in SKEYS}
-    for v in state.get("today_vote_log") or []:
-        d = 1 if v.get("side") == "buy" else -1
-        for lbl, sc in (v.get("votes") or {}).items():
-            k = LBL2KEY.get(lbl)
-            if k and sc * d >= config.QUANT_MIN_VOTE:
-                st[k]["trig"] += 1
-        k = vote.tag_key(v.get("tag", "")) or "none"
-        st[k]["exec" if v.get("executed") else "wait"] += 1
-    for pp in s_pairs:
-        k = vote.tag_key(pp["tag"]) or "none"
-        st[k]["realized"] += pp["pnl"]
-        st[k]["pair"] += 1
-        if pp["pnl"] > 0:
-            st[k]["win"] += 1
-    for o in s_opens:
-        k = vote.tag_key(o["tag"]) or "none"
-        p = lp.get(o["code"], o["price"])
-        diff = (p - o["price"]) if o["side"] == "buy" else (o["price"] - p)
-        st[k]["floating"] += o["qty"] * diff - o["fps"] * o["qty"]
-    out = []
-    for k in SKEYS:
-        s = st[k]
-        if not (s["trig"] or s["pair"] or s["exec"] or s["wait"] or s["floating"]):
-            continue
-        out.append({"label": SLBL[k], "trig": s["trig"], "exec": s["exec"],
-                    "wait": s["wait"], "realized": round(s["realized"], 2),
-                    "floating": round(s["floating"], 2),
-                    "win": s["win"], "pair": s["pair"]})
-    return out
+def _t_counts(state):
+    """净T次数统计(2026-11-12用户需求): 一对反向腿闭合=1次, 盈利>0计成功, 否则失败
+    口径与T腿配对明细一致(fifo_pairs): 止损/手动卖出不入对。
+    累计 = sim_trades.csv 全历史按时间序跨日FIFO(隔日T昨买今卖也能正确配对)"""
+    def _cnt(pairs):
+        win = sum(1 for p in pairs if p["pnl"] > 0)
+        return {"n": len(pairs), "win": win, "lose": len(pairs) - win}
+    p_today, _ = account.fifo_pairs(state["today_trades"])
+    today = _cnt(p_today)
+    hist = []
+    if os.path.exists(config.TRADES_CSV):
+        with open(config.TRADES_CSV, encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                side_txt = row.get("方向") or ""
+                if "止损" in side_txt:          # 与当日口径一致: 止损不入对
+                    continue
+                side = "buy" if ("买" in side_txt or "低吸" in side_txt) else "sell"
+                try:
+                    qty, price = int(float(row["股数"])), float(row["价格"])
+                    fee = float(row.get("费用") or 0)
+                except (KeyError, ValueError):
+                    continue
+                if qty <= 0:
+                    continue
+                hist.append({"code": (row.get("代码") or "").strip(),
+                             "name": row.get("名称") or "", "side": side,
+                             "qty": qty, "price": price, "fee": fee,
+                             "time": (row.get("日期") or "") + (row.get("时间") or "")})
+    cum = _cnt(account.fifo_pairs(sorted(hist, key=lambda t: t["time"]))[0])
+    return {"today": today, "cum": cum}
 
 
 # ---------------- 持仓标的日K/做T点 ----------------
@@ -281,7 +267,12 @@ def build(state, prices=None, rep_date=None, now=None, path=None):
     day_chg = (asset - prev_total) if prev_total else None
 
     t_rows, t_tot, t_info = _today_t(state, px, ops_by_code)
-    stats = _stats(state, px)
+    # 手动同步等非T成交(如清仓): 台账无记录, 补零值条目防KeyError
+    for t in state["today_trades"]:
+        if t["code"] not in t_info:
+            nm = (state["positions"].get(t["code"], {}).get("name")
+                  or t.get("name") or t["code"])
+            t_info[t["code"]] = (nm, 0.0, 0.0, 0.0, "手动同步成交(不计入T台账)")
     daily = _load_daily()
 
     # T腿配对明细(2026-11-03用户需求; 2026-11-09改总分结构+时间正序): 个股合计 + 逐对明细
@@ -372,6 +363,17 @@ def build(state, prices=None, rep_date=None, now=None, path=None):
                          + "".join(f"<td>{x}</td>" for x in cells[1:]) + "</tr>")
     if not grp_order:
         grp_html += '<tr><td colspan="7" class="mut">今日无做T交易</td></tr>'
+    # 未成交原因(2026-11-11用户需求: 零成交日日报写明原因; 有成交的股票不列)
+    for c, r in (state.get("v3_idle") or {}).items():
+        if c in grp_order:
+            continue
+        f0 = r.get("first") or ["未知原因", ""]
+        l0 = r.get("last") or ["", ""]
+        last_txt = (f" → 收盘前: {_esc(l0[0])}"
+                    if (l0[0] and l0[0] != f0[0]) else "")
+        grp_html += (f'<tr><td colspan="7" class="mut">🔍 未成交原因 · '
+                     f'<b>{_esc(r.get("name", c))}</b>: {_esc(f0[0])} '
+                     f'<span class="mut">({_esc(f0[1])})</span>{last_txt}</td></tr>')
     grp_html += "</table>"
 
     # 持仓概览
@@ -420,12 +422,6 @@ def build(state, prices=None, rep_date=None, now=None, path=None):
                          _pnl(fl),
                          f'<span class="mut">{_esc(tag)}</span>' if tag else ""])
 
-    # 策略统计
-    stat_tbl = [[_esc(s["label"]), str(s["trig"]), str(s["exec"]), str(s["wait"]),
-                 _pnl(s["realized"]), _pnl(s["floating"]),
-                 f'{s["win"]}/{s["pair"]}' if s["pair"] else "--"]
-                for s in stats]
-
     pend = [c for c, d in (state.get("stop_pending") or {}).items() if d == rep_date]
     warn = ""
     if pend:
@@ -444,6 +440,12 @@ def build(state, prices=None, rep_date=None, now=None, path=None):
                                      or d.get("cash") is not None):
             prev = d
             break
+    # 昨日现金快照: 零成交日daily无cash, 向前找最近一个有cash的交易日(现金不变语义)
+    prev_cash = None
+    for d in reversed(daily):
+        if d["date"] < rep_date and d.get("cash") is not None:
+            prev_cash = d
+            break
     payload = {"tt": {
         "rep_date": rep_date, "init_date": state.get("init_date"),
         "gen_time": now.strftime("%Y-%m-%d %H:%M"),
@@ -457,13 +459,13 @@ def build(state, prices=None, rep_date=None, now=None, path=None):
         "cum_net": round(sum(account.t_pnl(
             l, px.get(c) or (state.get("last_prices") or {}).get(c, 0))
             for c, l in state["cum_ledger"].items()) - state.get("cum_fee", 0), 2),
-        "prev": {k: prev.get(k) if prev else None
-                 for k in ("net", "cum", "cash", "fee")},
+        "prev": {**{k: prev.get(k) if prev else None
+                    for k in ("net", "cum")},
+                 "cash": prev_cash.get("cash") if prev_cash else None},
         "n_trade": len(state["today_trades"]), "n_hold": len(held),
         "n_skip": len(state.get("today_skips") or []),
-        "t_tot": t_tot, "stats": stats, "daily": daily,
+        "t_tot": t_tot, "daily": daily, "t_cnt": _t_counts(state),
         "stocks": stocks, "missing": missing,
-        "ai": dict(state.get("today_ai") or {}),
         "stop_mode": config.STOP_LOSS_MODE,
         "gap_exempt": bool(getattr(config, "ST_GAP_EXEMPT_EN", False)),
         "gap_confirm": str(getattr(config, "ST_GAP_CONFIRM", "14:50")),
@@ -475,10 +477,7 @@ def build(state, prices=None, rep_date=None, now=None, path=None):
         .replace("__TBL_LEGS__", leg_html) \
         .replace("__TBL_POS__", _tbl(
             ["股票", "持股", "现价", "市值", "基准成本", "今日T盈亏", "T收益率", "浮动盈亏", "备注"],
-            pos_rows)) \
-        .replace("__TBL_STAT__", _tbl(
-            ["策略", "触发", "执行", "观望", "已回补盈亏", "浮动", "胜率"],
-            stat_tbl))
+            pos_rows))
     path = path or DASH_PATH
     with open(path, "w", encoding="utf-8") as f:
         f.write(out)
@@ -508,9 +507,11 @@ font:14px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:26px 0 10px;
 border-left:3px solid var(--blue);padding-left:8px}
 .sub{color:var(--mut);font-size:12px;margin-bottom:16px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;align-content:start;align-items:start}
+.cards.two{grid-template-columns:repeat(2,1fr)}   /* 做T盈亏区: 盈亏卡+次数卡上下对齐两列 */
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
 .card .k{color:var(--mut);font-size:12px}.card .v{font-size:22px;font-weight:700;margin-top:4px}
+.card .s{font-size:11px;color:var(--mut);margin-top:5px;line-height:1.7}
 .pos{color:#ff5c5c}.neg{color:#4bd94b}.mut{color:var(--mut)}
 table{width:100%;border-collapse:collapse;background:var(--card);
 border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:13px}
@@ -542,8 +543,19 @@ border-radius:8px;padding:10px 12px;color:#f0c89a;font-size:13px;margin:10px 0}
 <div class="sub" id="sub"></div>
 <div id="warn">__WARN__</div>
 
-<h2>账户概况</h2>
-<div id="cards" class="cards"></div>
+<h2>账户概况 · 资金曲线</h2>
+<div class="cols">
+ <div class="chart"><div class="t"><span>每日总资产 (收盘估值)</span><span id="elg"></span></div>
+ <canvas id="eq" height="200"></canvas></div>
+ <div id="cards" class="cards"></div>
+</div>
+
+<h2>做T盈亏走势 (每日 / 今日 / 累计)</h2>
+<div class="cols">
+ <div class="chart"><div class="t"><span>每日净T盈亏 (含未回补浮动, 已扣费)</span><span id="nlg"></span></div>
+ <canvas id="net" height="200"></canvas></div>
+ <div id="tcards" class="cards two"></div>
+</div>
 
 <h2>今日做T总览 (总分: 个股合计 + 逐笔交易)</h2>
 <div id="tblt">__TBL_T__</div>
@@ -554,27 +566,12 @@ border-radius:8px;padding:10px 12px;color:#f0c89a;font-size:13px;margin:10px 0}
 <div id="legs">__TBL_LEGS__</div>
 <div class="note">隔日T按“昨买价→今卖价”独立配对; 其余按当日FIFO配对; 未平腿按最新价浮动估值(未平T仓/未回补)。</div>
 
-<h2>资金 / 每日盈亏</h2>
-<div class="cols">
- <div class="chart"><div class="t"><span>每日总资产 (收盘估值)</span><span id="elg"></span></div>
- <canvas id="eq" height="200"></canvas></div>
- <div class="chart"><div class="t"><span>每日净T盈亏 (含未回补浮动, 已扣费)</span><span id="nlg"></span></div>
- <canvas id="net" height="200"></canvas></div>
-</div>
-
 <h2>持仓概览</h2>
 <div id="pos">__TBL_POS__</div>
 
 <h2>持仓标的 日K与做T操作点</h2>
 <div class="note">均线: <b style="color:#b06bd6">MA5</b> · <b style="color:#f0a020">MA10</b> · <b style="color:#3f7fd0">MA20</b>　定点: <span style="color:#ff5c5c">▲低吸买入</span> / <span style="color:#4bd94b">▼高抛卖出</span> / <span style="color:#f0a020">▼止损</span>　鼠标移到K线上可查看当日做T详情</div>
 <div id="stocks"></div>
-
-<h2>策略统计(启发式)</h2>
-<div id="stats">__TBL_STAT__</div>
-<div class="note">口径: 触发=过线信号中该票同向且|分|≥0.3的次数; 已回补盈亏按FIFO配对扣双边费用, 归因于卖腿主导票; 胜率=已回补对子中盈利占比。空表表示今日无量化信号。</div>
-
-<h2>AI研判</h2>
-<div id="ai" class="note"></div>
 
 <div class="foot" id="foot"></div>
 </div>
@@ -614,22 +611,32 @@ document.getElementById('sub').textContent=
  +` | 止损模式 ${T.stop_mode}${T.gap_exempt?'(跳空豁免: 开盘深穿改收盘确认)':''}`;
 
 const P=T.prev||{};
-const dv=(cur,pv,noPct)=>{if(pv==null||cur==null)return'';
+const dv2=(cur,pv,noPct)=>{if(pv==null||cur==null)return'<span class="mut">-</span>';
  const d=cur-pv;const p=(pv!==0&&!noPct)?` (${d>=0?'+':''}${(d/Math.abs(pv)*100).toFixed(1)}%)`:'';
- return `<br><span style="font-size:11px;font-weight:400" class="${noPct?'mut':clr(d)}">较昨${d>=0?'+':''}${num(d)}${p}</span>`;};
-let cards=[
- ['当前总资产',num(T.total),''],
- [`较昨日收盘`,T.day_chg==null?'-':`${T.day_chg>=0?'+':''}${num(T.day_chg)} (${pctQ(T.day_chg_pct)})`,clr(T.day_chg||0)],
- [`较期初基准`,T.chg==null?'-':`${T.chg>=0?'+':''}${num(T.chg)} (${pctQ(T.chg_pct)})`,clr(T.chg||0)],
- ['今日净T盈亏',`${T.t_tot.net>=0?'+':''}${num(T.t_tot.net)}`,clr(T.t_tot.net)],
- ['累计净T盈亏(含浮动)',`${T.cum_net>=0?'+':''}${num(T.cum_net)}${dv(T.cum_net,P.cum)}`,clr(T.cum_net)],
- ['可用现金',num(T.cash)+dv(T.cash,P.cash,true),''],
- ['累计费用',num(T.cum_fee)+dv(T.cum_fee,P.fee,true),''],
- ['今日成交',`${T.n_trade} 笔`,''],
- ['持仓只数',`${T.n_hold} 只`,''],
-];
-document.getElementById('cards').innerHTML=cards.map(([k,v,c])=>
- `<div class="card"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join('');
+ return `<b class="${noPct?'mut':clr(d)}">${d>=0?'+':''}${num(d)}${p}</b>`;};
+const card=a=>a.map(([k,v,c,s])=>
+ `<div class="card"><div class="k">${k}</div><div class="v ${c||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`).join('');
+// 区块1: 账户概况(与资金曲线并排)
+document.getElementById('cards').innerHTML=card([
+ ['当前总资产',num(T.total),'',
+  `较昨日 ${T.day_chg==null?'<span class="mut">-</span>':`<b class="${clr(T.day_chg)}">${T.day_chg>=0?'+':''}${num(T.day_chg)} (${pctQ(T.day_chg_pct)})</b>`}<br>较期初 ${T.chg==null?'<span class="mut">-</span>':`<b class="${clr(T.chg)}">${T.chg>=0?'+':''}${num(T.chg)} (${pctQ(T.chg_pct)})</b>`}`],
+ ['可用现金',num(T.cash),'',`较昨日 ${dv2(T.cash,P.cash,true)}`],
+ ['累计费用',num(T.cum_fee),'',`较昨日 <b class="mut">+${num(T.t_tot.fee)}</b> (今日费用)`],
+]);
+// 区块2: 做T盈亏走势(与每日净T盈亏曲线并排)
+document.getElementById('nlg').innerHTML=`<span class="mut">今日成交 ${T.n_trade} 笔</span>`;
+const cnt=s=>{if(!s||!s.n)return['0=<span class="pos">0</span>:<span class="neg">0</span>','','<span class="mut">成功率 -</span>'];
+ return [`${s.n}=<span class="pos">${s.win}</span>:<span class="neg">${s.lose}</span>`,
+  '',`成功率 <b>${(s.win/s.n*100).toFixed(1)}%</b>`];};
+const tc=T.t_cnt&&T.t_cnt.today, cc=T.t_cnt&&T.t_cnt.cum;
+document.getElementById('tcards').innerHTML=card([
+ ['今日净T盈亏(已扣费)',`${T.t_tot.net>=0?'+':''}${num(T.t_tot.net)}`,clr(T.t_tot.net),
+  `已回补 <b class="${clr(T.t_tot.realized)}">${num(T.t_tot.realized)}</b> · 未回补浮动 <b class="${clr(T.t_tot.floating)}">${num(T.t_tot.floating)}</b> · 费用 <b>${num(T.t_tot.fee)}</b>`],
+ ['累计净T盈亏(含浮动)',`${T.cum_net>=0?'+':''}${num(T.cum_net)}`,clr(T.cum_net),
+  `较昨日 ${T.cum_net==null||P.cum==null?'<span class="mut">-</span>':dv2(T.cum_net,P.cum)}`],
+ ['今日净T次数',...cnt(tc)],
+ ['累计净T次数',...cnt(cc)],
+]);
 
 document.getElementById('tsum').innerHTML=
  `<span>日内已回补T <b class="${clr(T.t_tot.realized)}">${num(T.t_tot.realized)}</b></span> · `
@@ -669,7 +676,7 @@ window.__drawEq=function(hover){const cv=document.getElementById('eq');if(!cv)re
   ctx.beginPath();ctx.moveTo(hx,pad);ctx.lineTo(hx,H-pad);ctx.stroke();ctx.setLineDash([]);
   ctx.fillStyle='#e8edf5';ctx.beginPath();ctx.arc(hx,hy,7,0,7);ctx.fill();}
  const last=DAILY[DAILY.length-1];
- document.getElementById('elg').innerHTML=`<span class="mut">${DAILY.length} 个交易日 · 最新 ${num(last.total)}</span>`;
+ document.getElementById('elg').innerHTML=`<span class="mut">${DAILY.length} 个交易日 · 最新 ${num(last.total)} · 持仓 ${T.n_hold} 只</span>`;
  window.__eq_st={pad:pad,W:W,n:DAILY.length};};
 window.__drawEq(null);
 if(DAILY.length)attachHover(document.getElementById('eq'),i=>window.__drawEq(i),
@@ -780,12 +787,6 @@ window.__st_state={};
    cx=>window.__st_state[c]?idxOf(cx,window.__st_state[c].pad,window.__st_state[c].W,window.__st_state[c].n):null,
    i=>window.__st_tip(c,i));}
 })();
-
-// ---------- AI研判 ----------
-(function(){const a=T.ai||{};const el=document.getElementById('ai');
- if(!a.asked){el.innerHTML='<span class="mut">今日无AI研判请求</span>';return;}
- el.innerHTML=`🤖 AI研判: <b>${a.asked}</b> 次 (建议执行 <b class="pos">${a.execute||0}</b> / `
-  +`建议观望 <b class="neg">${a.wait||0}</b> / 失败 <b>${a.fail||0}</b>)`;})();
 
 window.addEventListener('resize',()=>{
  for(const c in (T.stocks||{}))window.__drawS&&window.__drawS(c);

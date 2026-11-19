@@ -16,8 +16,9 @@
   - T+1规则: 当日买入部分当日不可卖(做T高抛受限;
       止损清仓/手动同步真实卖出豁免), 次日开盘自动解禁
   - mystock_test.csv 为真实持仓母表(只读): 由你(截图工具)或 python holdings_editor.py
-      网页维护; 编辑器保存时可"一键分发"到 data\ttrade\holdings.csv 与
-      data\quant\holdings.csv, 两子系统各自只读自己那份, 均不读/写母表
+      网页维护; 编辑器可上传券商持仓截图自动OCR识别(rapidocr, 识别行高亮人工修正),
+      【同步】按钮可选分发到 data\ttrade\holdings.csv / data\quant\holdings.csv / 两者,
+      两子系统各自只读自己那份, 均不读/写母表
   - 每天15:00推送收盘战报到微信(今日做T盈亏/累计盈亏/账户概况)
       并追加 v2.1 双模策略次日信号(趋势买/超跌买/破位卖/保险丝, 见 core/adaptive.py)
       同时在 report\ttrade\dashboard_ttrade.html 生成 T 专属看板(与量化看板互不覆盖)
@@ -60,6 +61,28 @@
     python ttrade\main.py --reset
     注意: 会清空做T盈亏记录, 慎用! 重置前请确认已用 holdings_editor.py 一键分发过母表
 
+手动生成各类日报 / 看板(补跑或重出, 与15:15自动任务同口径):
+  T日报(收盘战报+微信推送+dashboard_ttrade.html, 幂等: 当日已发则跳过):
+    python ttrade\main.py --eod
+    想强制重发需先改 data\ttrade\sim_state.json 的 eod_sent 字段
+  T日报预览(仅打印, 不推送不写状态):
+    python ttrade\main.py --test-eod
+  量化日报(推进+推送复盘日报+dashboard_quant.html):
+    python quant_daily.py                正常日跑(推送)
+    python quant_daily.py --no-push      只记账+生成看板, 不推微信
+    python quant_daily.py --dry          干跑(不写状态不推送)
+    漏跑多天会自动逐日补跑, 重复运行幂等
+  Lab实验报告(策略对比+dashboard_lab.html):
+    python run_lab.py --list             列出全部已注册实验策略
+    python run_lab.py -s <策略名>        prod基线 vs 指定策略 逐标的对比
+    python run_lab.py -s <策略名> --html 追加生成 report\dashboard_lab.html
+    python run_lab.py -s <策略名> --minute   分钟级策略对比
+  T策略回测(参数扫描/因子验证, 不影响监控进程):
+    python -m ttrade.bt_ttrade           默认6只持仓股回测(基线口径)
+    python -m ttrade.bt_ttrade --chip    启用筹码密集区+滞涨因子(config定版参数)
+    python -m ttrade.bt_ttrade --sweep   参数网格扫描(108组)
+    python -m ttrade.bt_ttrade --m5 4800 拉长5分钟K窗口(更多交易日)
+
 五、参数调整
 ----------------------------------------------------------------
 参数按三层分开放, 改动位置取决于影响范围:
@@ -74,8 +97,9 @@
     - T_EXCLUDE_CODES / QT_EXCLUDE_CODES  剔除名单(不入持仓/不做T/不参与信号)
     - BT_CAPITAL       回测期初资金锚点 / BT_EXCLUDE_CODES 回测抛弃标的
     - CACHE_DIR 等机器路径 / LAB_BASE_* lab盘前实验基准(持股/成本)
-  真实持仓维护: mystock_test.csv(母表, 不入库) 经 holdings_editor.py 编辑并一键分发
-  到两子系统; 持仓/成本/成交流水/日报/看板等个人数据均在 data\ 与 report\ (不入库)
+  真实持仓维护: mystock_test.csv(母表, 不入库) 经 holdings_editor.py 编辑(支持券商截图
+  OCR识别后人工修正), 【同步】按钮按需分发到两子系统; 持仓/成本/成交流水/日报/看板等
+  个人数据均在 data\ 与 report\ (不入库)
 
   - REFRESH_SECONDS     行情刷新间隔(默认60秒)
   - DEEPSEEK_GATEKEEP   AI守门开关(True=AI观望则不成交)
@@ -115,7 +139,7 @@
                         state(状态读写) ledger(做T盈亏) vote(投票决策核)
                         strategy(做T信号调度) account(做T模拟盘账户) ai(DeepSeek守门)
                         runner(监控+做T主循环) auction(9:26竞价微调) tplan_gen(9:25重算t_plan)
-                        ttrade_v2(v2反T策略) replay(≤5日分时回放) bt_ttrade(流水回测)
+                        ttrade_v3(v3做T策略) replay(≤5日分时回放) bt_ttrade(流水回测)
                         dashboard(T专属看板 dashboard_ttrade.html)
     quant\              ★量化子系统(独立): account(状态/流水) engine(日频编排+日报)
                         picker(智能选股) dashboard(量化看板 dashboard_quant.html)
@@ -124,15 +148,16 @@
                         strategies/(实验策略注册表) tools/(一次性验证脚本)
     quant_daily.py      量化子系统入口(15:15 由 stop.ps1 触发)
     run_backtest.py     回测独立入口     run_lab.py  实验室入口
-    holdings_editor.py  持仓母表+观察池网页编辑器(保存时可一键分发到两子系统)
+    holdings_editor.py  持仓母表+观察池网页编辑器(截图OCR识别持仓, 同步按钮可选分发到
+                        T模拟盘/量化账本/两者)
     monitor.log/monitor_err.log   监控进程日志(公共)
-    mystock_test.csv   真实持仓母表(只读, 由你+编辑器维护): 经"一键分发"生成
+    mystock_test.csv   真实持仓母表(只读, 由你+编辑器维护): 经【同步】按钮分发到
                        data\ttrade\holdings.csv 与 data\quant\holdings.csv,
                        两子系统只读各自那份, 任何时候都不读/写母表
     report\            看板HTML目录(2026-10-28起 T/量化分子目录):
                        ttrade\dashboard_ttrade.html(T, 每日15:15日跑生成, 归档ttrade\history\)
                        quant\dashboard_quant.html(量化, 每日15:15生成, 归档quant\history\)
-                       dashboard_backtest.html(回测) / dashboard_lab.html(实验)在根目录
+                       dashboard_backtest.html(回测) / dashboard_lab.html(实验)均在report\根目录
     data\ttrade\       T 数据: holdings.csv / sim_state.json / sim_trades.csv / trades.log
     data\quant\        量化数据: holdings.csv / quant_state.json / quant_trades.csv /
                        quant_trades.log / watchlist.csv / quant_run.log
@@ -360,3 +385,77 @@
 ⚠ 局限(必读): 板块历史成分股名单不可得 -> "板块维度"无法做点内时间回测(存在幸存者偏差),
   只能靠实盘日报逐日积累验证; 个股层面的入选规则与v2.1回测口径一致(无未来函数).
   建议先看几日报纸面记录, 确认选股质量后再视情调整 PICK_* 参数.
+
+十、T子系统最近更新记录(ttrade)
+----------------------------------------------------------------
+★策略标识v2→v3统一更名(2026-11-17 用户需求): 做T策略已是v3(基础编排+SVM日频方向
+  指导), 全局v2标识更名为v3: 模块ttrade_v2.py→ttrade_v3.py(v2_check→v3_check);
+  配置STRAT_V2_EN→STRAT_V3_EN、V2_*→V3_*; 状态字段v2_env/v2_legs/v2_carry/
+  v2_idle/v2_last_open→v3_*(load_state一次性迁移, v2_carry正T隔日腿跨日保留);
+  微信推送文案与成交标签"v2隔日T"→"v3隔日T"(台账配对兼容旧v2标签);
+  看板/Readme/项目结构说明同步。行为完全不变, 纯命名升级。
+★v3.1 SVM改日频 + 新闻雷达(2026-11-16 用户需求, 周频指导并入新闻特征):
+  - 新闻雷达(新增 ttrade\news_radar.py + common\news.py, 东财7x24快讯):
+    ①盘中秒级告警: 主循环行情间隙每15秒(NEWS_POLL_SEC)轮询快讯, 关联码
+      (快讯自带stockList个股/板块码)或重磅词命中 -> DeepSeek分级, 重大级
+      秒级微信推送(只观察不交易, 推文注明"不构成操作指令"); 一般级仅记录
+    ②8:45隔夜汇总: 交易日8:45拉"上一交易日15:00收盘后"全部快讯(覆盖夜间+
+      周末, 周一自动覆盖整个周末), DeepSeek分批(25条/批)打分 -> 宏观要点/
+      板块情绪/持仓相关三段微信推送 + 存data\ttrade\news_history.json按日累积
+  - SVM周频改日频(ml_guide.py重写): 每交易日9:00用"截至昨日收盘"的3个月日线
+    (V3_ML_DAYS=520->65, 用户定: 不用2年) + 隔夜新闻分(9因子=7价格+2新闻,
+    无记录=0退化为纯价格) 重训SVM, 预测指导当日方向(闸门语义不变: 涨禁反T/
+    跌禁正T+禁回补), 落盘data\ttrade\ml_day.json并推送;
+    9:00-9:28窗口幂等(进程隔夜崩溃由9:25计划任务重启后仍能补训);
+    周五EOD重训/周一兜底逻辑已移除(被每日重训取代), ml_week.json已废弃删除
+  - t_plan参考: 9:26生成时注入因子E(ml_note+隔夜新闻分)到计划说明列
+    (仅展示参考, 不改价位; 实际闸门在交易层ttrade_v3生效)
+  - 调度适配(runner.py): 监控进程改为过夜存活(stop.ps1不再杀它, 仅杀量化
+    runner), 醒来时点重排为8:45(新闻汇总)->9:00(SVM)->9:25(t_plan)->9:30开盘;
+    8:45无法改计划任务时间(无管理员权限)的替代方案, 已验证
+  - 开关: NEWS_RADAR_EN/NEWS_LLM_EN(雷达), V3_ML_EN(SVM, False=仅基础编排)
+  - 成本: 雷达仅关联/重磅词命中才送LLM(实测约1/50); 8:45汇总约40批DeepSeek
+    (周末积压981条约2分钟跑完); 全链路失败安全(雷达挂->SVM退化纯价格->基础编排照跑)
+★做T策略v3: 基础编排(原v2) + SVM周频方向指导(2026-11-13, 回测+3.2倍后用户确认上线;
+  2026-11-16起升级为上述日频版):
+  - 机制: 每周一开市前用"截至上周五收盘"的2年日线重训SVM(全局参数C=0.5/rbf/
+    gamma=auto, 7因子15日窗口, 标签=5个交易日后收盘更高?), 同一预测全周固定:
+    预测涨(1)=本周正T为主 -> 禁反T卖出腿(防卖飞, 保上行);
+    预测跌(0)=本周反T为主 -> 禁正T买入+禁网格回补(不接飞刀, 反T照卖,
+    未回补腿由14:45收盘兜底闭合)。无未来函数已独立审计(训练数据严格早于周一)
+  - 实现: 新增 ttrade\ml_guide.py(训练/预测/持久化); ttrade_v3.v3_check三处闸门
+    (①反T卖/②网格回补/③正T, 与bt_ttrade.py回测档同语义); 零成交原因新增ML说明
+  - 生成时机: 每周最后交易日收盘日跑(do_eod)自动重训下一周一整周预测存
+    data\ttrade\ml_week.json并微信推送预测汇总(涨/跌分组+操作指导);
+    周一9:25兜底补训(节假日漏训/首次启用);
+    文件缺失/周不匹配=无指导按基础编排跑(失败安全)
+  - 开关: config_ttrade.py V3_ML_EN(True=启用, False=仅基础编排), 训练窗V3_ML_DAYS=65
+  - 回测(7只持仓, 2026-09-24~11-13): 基线+2,103 vs v3指导+6,696(3.2倍,
+    夏普0.22->0.44); 复现: python ttrade\bt_ttrade.py --ml
+  - 预览今日预测(dry): python -c "from ttrade import state as s,ml_guide as m,
+    datetime as d; m.train_day(s.load_state(), s.load_t_plan(),
+    d.datetime.now(), dry=True)"
+★零成交日日报写明未成交原因(2026-11-11 用户需求): 当日一笔T都没做成的股票, 日报
+  "今日做T"与看板会写明诊断原因(首次判定时间+收盘前最新状态), 优先级:
+  竞价平开弃做 -> 尾盘闸门 -> 筹码密集区内部禁做 -> 反T侧(腿未闭合/达上限/可卖不足/
+  T量不足/冷却/未触发, 附距高抛区差距+VWAP乖离) -> 正T侧(单边下跌/已开/冷却/
+  乖离未达/未企稳/未收阳/量不足)。实现: ttrade_v3.py _note_idle/_idle_why,
+  state["v3_idle"]每日rollover清理, 当日动过账自动清除
+★做T策略接入筹码密集区+滞涨因子(2026-11-11, 当时为v2基础编排阶段,
+  31交易日回测扫参后用户确认只落地滞涨):
+  - 新增 ttrade\chip.py: 换手衰减筹码分布(chip_zone, 流通盘未知按60×中位量近似,
+    累计≥70%筹码的最窄连续价格带) + 滞涨形态判定(stall_shape, 最近2根5分钟高点
+    不再抬高+最新收阴)
+  - 落地行为(config_ttrade.py V3_CHIP_STALL_EN=True): ①滞涨开反T——未到高抛区但
+    出现滞涨+VWAP乖离≥1.0%(V3_STALL_DEV)时提前兑现, 备注"滞涨/密集区上沿兑现";
+    ③正T乖离门槛——股价在密集区下沿支撑带内时放宽为-1.5%(V3_SUPPORT_DEV)
+  - 密集区内部禁做(V3_INSIDE_BLOCK)回测有害默认关, 上/下沿触发代码保留积累数据
+  - 回测口径: T+1约束/当日FIFO配对/正T隔日开盘出场/日盈亏夏普(bt_ttrade.py metrics)
+★dashboard_ttrade.html 改版(2026-11-11 用户需求, 图+文合并):
+  - 「账户概况 · 资金曲线」: 每日总资产曲线(含期初基准虚线) + 合并卡片
+    (当前总资产副行: 较昨日/较期初两行 + 可用现金/累计费用较昨环比),
+    持仓只数为图表标题行文字提示
+  - 「做T盈亏走势 (每日/今日/累计)」紧跟其后: 每日净T盈亏柱状图 + 合并卡片
+    (今日净T盈亏副行: 已回补/未回补浮动/费用 + 累计净T盈亏副行: 较昨),
+    今日成交笔数为图表标题行文字提示
+  - 卡片高度自适应内容(不再被图表列拉伸), 看板每日随 --eod 自动重建并归档 history\

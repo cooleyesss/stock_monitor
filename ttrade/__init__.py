@@ -14,7 +14,7 @@
   auction.py           9:26 集合竞价自动更新 t_plan (高开/低开/跳空极宽三分支, 不做剧烈重算)
   tplan_gen.py         9:25 四因子重算 t_plan 价位(行情/大盘/竞价/新闻)
   replay.py            ≤5日分时逐bar回放(做T专用回测)
-  ttrade_v2.py         v2反T策略(STRAT_V2_EN 开关, 接管 check_signal)
+  ttrade_v3.py         v3做T策略(STRAT_V3_EN 开关, 接管 check_signal)
   dashboard.py         生成 report/ttrade/dashboard_ttrade.html(纯日内T看板, 与量化看板互不覆盖)
   bt_ttrade.py         做T回测(读 data/ttrade/ 流水)
 

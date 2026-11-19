@@ -1,12 +1,15 @@
-﻿# unified stopper (T侧监控 + 量化盘中双窗口runner)
+﻿# unified stopper (量化盘中双窗口runner)
 # $PSScriptRoot在某些调用方式下为空(2026-10-29实测), 兜底固定路径防Join-Path崩溃丢T侧日跑
 # 2026-11-05: 进程识别优先按 data\pids\*.pid(start.ps1 -PassThru 落盘, PID|启动时间);
 #   本机 CIM 查询 CommandLine 为空导致旧正则失效(15:15任务杀不掉监控), 正则保留作兼容兜底
+# 2026-11-16: T侧监控进程改为"过夜存活"(stop不再杀它): 次日8:45自动醒跑新闻雷达
+#   隔夜汇总+9:00 SVM日频重训(runner.seconds_to_next_window重排醒来时点);
+#   仅量化runner照旧15:15退出(次日9:25由start.ps1重新拉起)。
 $root = if ($PSScriptRoot) { $PSScriptRoot } else { 'D:\trae_projects\stock_monitor' }
 $pidDir = Join-Path $root 'data\pids'
 $killed = @()
 
-foreach ($f in @('ttrade_monitor.pid', 'quant_runner.pid')) {
+foreach ($f in @('quant_runner.pid')) {
     $pf = Join-Path $pidDir $f
     if (-not (Test-Path $pf)) { continue }
     $parts = (Get-Content $pf -Raw).Trim() -split '\|'
@@ -23,7 +26,7 @@ foreach ($f in @('ttrade_monitor.pid', 'quant_runner.pid')) {
     Remove-Item $pf -Force -ErrorAction SilentlyContinue
 }
 
-$existing = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match 'stock_monitor\\(ttrade\\main|quant_runner)\.py' }
+$existing = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match 'stock_monitor\\quant_runner\.py' }
 if ($existing) {
     $existing | ForEach-Object {
         if ($killed -notcontains $_.ProcessId) { Stop-Process -Id $_.ProcessId -Force; $killed += $_.ProcessId }

@@ -10,7 +10,7 @@ import datetime
 import math
 
 from common import quotes
-import vote
+from ttrade import vote          # 决策核在 ttrade/vote.py(模块搬家后的正确路径)
 from common import fees as _fees
 from core.indicators import build_ind
 import config_quant as config

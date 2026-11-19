@@ -5,6 +5,7 @@ from ttrade import config_ttrade as config
 from common import textparse
 from ttrade import state as tstate
 from common import notify
+from common import quotes
 from common.fees import is_etf, buy_fee, sell_fee
 from ttrade.ledger import t_pnl, t_pnl_detail
 from ttrade import vote
@@ -54,8 +55,8 @@ def _led(state, code, cum=False):
 
 
 def _is_carry_trade(t):
-    """隔日T成交判定: v2隔日T出场(昨买→今卖, 带昨买价yday_buy)"""
-    return (t.get("strat") == "v2隔日T" and t.get("yday_buy")
+    """隔日T成交判定: v3隔日T出场(昨买→今卖, 带昨买价yday_buy); 兼容改名前旧台账的v2隔日T"""
+    return (t.get("strat") in ("v3隔日T", "v2隔日T") and t.get("yday_buy")
             and t.get("side") == "sell")
 
 
@@ -127,7 +128,7 @@ def basis_cost(pos):
 
 
 def t_leg_pairs(trades, px):
-    """今日T腿配对(2026-11-03用户需求): 隔日T(strat=v2隔日T且带昨买价yday_buy)
+    """今日T腿配对(2026-11-03用户需求): 隔日T(strat=v3隔日T且带昨买价yday_buy, 兼容旧v2标签)
     独立配对"昨买→今卖"; 其余按当日FIFO。
     返回 (info, rows):
       info: {id(成交记录): {"bp":[买价], "sp":[卖价]}} 每笔成交的配对价(可能多对)
@@ -137,7 +138,7 @@ def t_leg_pairs(trades, px):
     for t in trades:
         if t.get("side") not in ("buy", "sell"):
             continue
-        (carry if (t.get("strat") == "v2隔日T" and t.get("yday_buy"))
+        (carry if (t.get("strat") in ("v3隔日T", "v2隔日T") and t.get("yday_buy"))
          else rest).append(t)
     info, rows = {}, []
 
@@ -280,6 +281,7 @@ def execute_buy(state, code, name, qty, price, note="", ai_txt="", dry=False,
                   note, ai_txt, dry, strategy_tags)
     rec.update({"shares_before": old, "shares_after": pos["shares"],
                 "cash_before": cash_before, "cash_after": state["cash"]})
+    tstate.save_state(state)   # rec补字段在_record内部保存之后, 需再存一次
     _write_trade_log(rec, dry)
     print(f"[成交] {SIDE_LABEL['buy']} {name} {qty}股@{fmt_price(price)} "
           f"金额{fmt_amt(amount)} 费{fmt_amt(fee)} "
@@ -336,6 +338,7 @@ def execute_sell(state, code, name, qty, price, side="sell", note="",
                   note, ai_txt, dry, strategy_tags)
     rec.update({"shares_before": old, "shares_after": pos["shares"],
                 "cash_before": cash_before, "cash_after": state["cash"]})
+    tstate.save_state(state)   # rec补字段在_record内部保存之后, 需再存一次
     _write_trade_log(rec, dry)
     print(f"[成交] {SIDE_LABEL[side]} {name} {qty}股@{fmt_price(price)} "
           f"金额{fmt_amt(amount)} 费{fmt_amt(fee)} "
@@ -391,11 +394,83 @@ def today_t_summary(state):
 
 
 def today_t_summary_html(state):
-    n, gross, fee, net = today_t_summary(state)
-    return (notify.sec("📈 今日T汇总") + notify.table(
-        ["已T笔数", "做T毛利", "费用", "当日T净盈亏"],
-        [[str(n), fmt_pnl(gross), fmt_amt(fee),
-          notify.colored(notify.bold(fmt_pnl(net)), notify.pnl_color(net))]]))
+    """盘中微信推送尾部: 今日做T总览(总分: 个股合计+逐笔成交), 与日报同口径
+    (2026-11-12用户需求: 原4列汇总表信息量不足, 改为日报同款总分总览)"""
+    trades = state["today_trades"]
+    px = dict(state.get("last_prices") or {})
+    grp_order = []
+    for t in trades:
+        if t["code"] not in grp_order:
+            grp_order.append(t["code"])
+    for c, led in (state.get("today_ledger") or {}).items():
+        if (led.get("bq") or led.get("sq")) and c not in grp_order:
+            grp_order.append(c)
+    if grp_order:   # 盘中拉实时价估值未回补腿(失败回退last_prices)
+        try:
+            px.update({c: q.get("price") or px.get(c, 0)
+                       for c, q in quotes.fetch_quotes(grp_order).items()})
+        except Exception:
+            pass
+    leg_info, _ = t_leg_pairs(trades, px)
+    names = {t["code"]: t["name"] for t in trades}   # 清仓后positions已无此股
+    # 个股合计(总) + 逐笔成交(分) —— 与 build_eod_summary 的日报总览完全同口径
+    t_map, realized_today, floating_today = {}, 0.0, 0.0
+    for c in grp_order:
+        led = state["today_ledger"].get(c) or {}
+        price = px.get(c) or state.get("last_prices", {}).get(c, 0)
+        if led.get("bq") or led.get("sq"):   # T台账口径的盈亏
+            rz, fl = t_pnl_detail(led, price)
+            net = led.get("bq", 0) - led.get("sq", 0)
+            extra = f"{'多买' if net > 0 else '多卖'}{abs(net)}股未回补" if net else ""
+            pn = t_pnl(led, price)
+        else:   # 手动同步等非T成交(如清仓): 无T盈亏, 仅列逐笔明细
+            rz = fl = pn = 0.0
+            extra = "手动同步成交(不计入T台账)"
+        realized_today += rz
+        floating_today += fl
+        t_map[c] = (state["positions"].get(c, {}).get("name")
+                    or names.get(c) or c, rz, fl, pn, extra)
+    fee_today = state.get("today_fee", 0)
+    net_today = realized_today + floating_today - fee_today
+
+    H = [notify.sec(f"📊 今日做T总览 ({len(trades)}笔, 总分)")]
+    if not grp_order:
+        H.append(notify.colored("今日无做T交易", config.C_GRAY))
+    for c in grp_order:
+        nm, rz, fl2, pn, ex = t_map[c]
+        head = (f"<b>{nm}</b>　已回补T"
+                f"{notify.colored(fmt_pnl(rz), notify.pnl_color(rz))} · "
+                f"未回补浮动{notify.colored(fmt_pnl(fl2), notify.pnl_color(fl2))} · "
+                f"合计{notify.colored(notify.bold(fmt_pnl(pn)), notify.pnl_color(pn))}"
+                + (notify.colored(f" ({ex})", config.C_GRAY) if ex else ""))
+        H.append(f'<div style="margin:8px 0 2px;font-size:13px;">{head}</div>')
+        rows = []
+        for t in [x for x in trades if x["code"] == c]:
+            sd = notify.colored(notify.bold(
+                {"buy": "买入", "sell": "卖出"}.get(
+                    t["side"], t.get("side_txt") or t["side"])),
+                config.C_GREEN if t["side"] in ("sell", "stop_clear",
+                                                "stop_t", "manual_sell")
+                else config.C_RED)
+            inf = leg_info.get(id(t))
+            if inf:
+                bp = "/".join(inf["bp"]) or "—"
+                sp = "/".join(inf["sp"]) or "—"
+            else:   # 非T腿成交(止损/手动同步): 显示自身成交价
+                bp = fmt_price(t["price"]) if t["side"] == "buy" else "—"
+                sp = fmt_price(t["price"]) if t["side"] != "buy" else "—"
+            rows.append([t["time"][:5], sd, str(t["qty"]), bp, sp,
+                         f"{t.get('shares_before', '?')}→{t.get('shares_after', '?')}",
+                         notify.colored(t.get("strat") or "", config.C_GRAY)])
+        H.append(notify.table(
+            ["时间", "方向", "股数", "买价", "卖价", "持仓变化", "T类"], rows))
+    H.append(notify.table(
+        ["已回补T合计", "未回补浮动", "费用", "今日净盈亏"],
+        [[notify.colored(fmt_pnl(realized_today), notify.pnl_color(realized_today)),
+          notify.colored(fmt_pnl(floating_today), notify.pnl_color(floating_today)),
+          fmt_amt(fee_today),
+          notify.colored(notify.bold(fmt_pnl(net_today)), notify.pnl_color(net_today))]]))
+    return "".join(H)
 
 
 # ---------------- 收盘报告 ----------------
@@ -474,6 +549,10 @@ def build_eod_summary(state, prices, now):
 
     n_skip = len(state["today_skips"])
 
+    # 未成交原因(2026-11-11用户需求: 零成交日日报需写明原因; 有成交的股票不列)
+    idle = {c: r for c, r in (state.get("v3_idle") or {}).items()
+            if c not in grp_order}
+
     # ---- 策略归因统计(多策略投票引擎, 启发式口径) ----
     vote_log = state.get("today_vote_log") or []
     s_pairs, s_opens = fifo_pairs(trades)
@@ -536,6 +615,16 @@ def build_eod_summary(state, prices, now):
             P.append(f"    {t['time'][:5]} {sd}{t['qty']}股 买{bp}→卖{sp} "
                      f"持仓{t.get('shares_before', '?')}→{t.get('shares_after', '?')}"
                      + (f" [{t['strat']}]" if t.get("strat") else ""))
+    if idle:
+        P.append("── 未成交原因(以下股票今日零成交) ──")
+        for c, r in idle.items():
+            f0 = r.get("first") or ["未知原因", ""]
+            l0 = r.get("last") or ["", ""]
+            line = f"{_w(r.get('name', c), 9)}{f0[0]}" \
+                   + (f"({f0[1]})" if f0[1] else "")
+            if l0[0] and l0[0] != f0[0]:
+                line += f" -> 收盘前: {l0[0]}"
+            P.append(line)
     P.append(f"汇总: 已回补T{fmt_pnl(realized_today)} | 未回补浮动: "
              f"{fmt_pnl(floating_today)}元 | 费用: {fmt_amt(fee_today)}元 | "
              f"今日净盈亏: {fmt_pnl(net_today)}元")
@@ -612,6 +701,19 @@ def build_eod_summary(state, prices, now):
                          notify.colored(t.get("strat") or "", config.C_GRAY)])
         H.append(notify.table(
             ["时间", "方向", "股数", "买价", "卖价", "持仓变化", "T类"], rows))
+    if idle:
+        irows = []
+        for c, r in idle.items():
+            f0 = r.get("first") or ["未知原因", ""]
+            l0 = r.get("last") or ["", ""]
+            last_txt = l0[0] if (l0[0] and l0[0] != f0[0]) else ""
+            irows.append([r.get("name", c),
+                          notify.colored(f"{f0[0]}"
+                                         + (f" ({f0[1]})" if f0[1] else ""),
+                                         config.C_GRAY),
+                          notify.colored(last_txt, config.C_GRAY)])
+        H.append(notify.sec("🔍 未成交原因(今日零成交股票)"))
+        H.append(notify.table(["股票", "首次判定(时间)", "收盘前状态"], irows))
     H.append(notify.table(
         ["已回补T合计", "未回补浮动", "费用", "今日净盈亏"],
         [[notify.colored(fmt_pnl(realized_today), notify.pnl_color(realized_today)),
@@ -712,6 +814,11 @@ def build_eod_log(state, prices, summary):
                      f"费{fmt_amt(t['fee'])}{ai}")
     else:
         L.append("  今日无做T交易")
+    for c, r in (state.get("v3_idle") or {}).items():
+        f0 = r.get("first") or ["未知原因", ""]
+        l0 = r.get("last") or ["", ""]
+        extra = f" -> 收盘前: {l0[0]}" if (l0[0] and l0[0] != f0[0]) else ""
+        L.append(f"  未成交原因 {r.get('name', c)}: {f0[0]}{extra}")
     L.append("  ── 日内T盈亏 ──")
     any_led = False
     for code, led in state["today_ledger"].items():

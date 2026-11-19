@@ -1,31 +1,35 @@
 # -*- coding: utf-8 -*-
-"""做T策略v2: 反T编排 + 网格回补 + 环境过滤 + 收盘兜底 (2026-10-30 用户需求, 回测验证)
+"""做T策略v3: 反T编排 + 网格回补 + 环境过滤 + 收盘兜底 + SVM日频方向指导
+(基础编排 2026-10-30 用户需求回测验证, 原名v2; 2026-11-13 并入SVM方向指导升级为v3周频,
+ 2026-11-16 SVM改日频+新闻特征, 2026-11-17 全局v2标识统一更名为v3)
 
 背景(数据诊断): 旧策略15个交易日61笔成交仅3对当日回补(回补率≈6%), 三大根因:
   ① T+1死锁: "先买后卖"正T的买入腿当日制度性不可卖, 48条腿挂起
   ② 低吸区接飞刀: BOLL下轨+0.1ATR就接, 止损线仅低0.5ATR, 下跌中继反复触发
   ③ 止损清仓后无任何回补通道(兰石10-30低吸5.43踩止损线5.43即典型)
 
-v2方案(市面常用做T技术整合, 与bt_ttrade.py回测口径一致):
+v3基础编排(市面常用做T技术整合, 与bt_ttrade.py回测口径一致):
   ① 反T为主: 高抛卖昨仓(高抛区 或 VWAP上乖离≥2%且收阳) -> 网格分档回补
      (卖价下方0.5/1.0/1.5×间距各接1/3) -> 14:45未回补部分现价兜底闭合
   ② 环境过滤: 竞价平开±1%弃做 / 单边下跌日(gap≤-2%或弱势股低开)禁正T / 14:40后不开新腿
   ③ 正T谨慎: 仅VWAP深乖离-2% + 近3根5分钟不创新低 + 收阳 才接, 且隔日开盘出场
-  ④ 止损改告警: v2的网格回补+兜底即T腿风控, 底仓不动; 需清仓保护请关STRAT_V2_EN回退v1
+  ④ 止损改告警: v3的网格回补+兜底即T腿风控, 底仓不动; 需清仓保护请关STRAT_V3_EN回退v1
 
 回测(2026-10-22~10-30, 6只持仓股): 旧4对+1,696.47(止损2次) / 新40对+3,993.76
 (回补率≈80%, 零止损, 费304<494); 已知偏差: 回测窗口偏空利于反T兜底, 单边上涨市兜底会小亏。
 
-状态字段: state["v2_env"](当日环境) / state["v2_legs"](未回补卖出腿) /
-         state["v2_carry"](正T隔日腿, 跨日保留) / state["v2_last_open"](开腿冷却)
-回退: config.STRAT_V2_EN=False 即回退v1(区间+量化投票+AI守门), v2字段由rollover清理。
-挂接: strategy.check_signal 顶部(STRAT_V2_EN=True时完全接管, 不与v1同日双跑)。
+状态字段: state["v3_env"](当日环境) / state["v3_legs"](未回补卖出腿) /
+         state["v3_carry"](正T隔日腿, 跨日保留) / state["v3_last_open"](开腿冷却)
+回退: config.STRAT_V3_EN=False 即回退v1(区间+量化投票+AI守门), v3字段由rollover清理。
+挂接: strategy.check_signal 顶部(STRAT_V3_EN=True时完全接管, 不与v1同日双跑)。
 """
 import datetime
 from ttrade import config_ttrade as config
 from common import notify
 from common import quotes
 from ttrade import account
+from ttrade import chip
+from ttrade import ml_guide
 from ttrade import vote
 
 
@@ -44,15 +48,15 @@ def _std_lot(qty):
 
 
 def _cool(state, code, side, now):
-    """同方向开腿冷却(分钟); state["v2_last_open"]由rollover每日清理"""
-    if config.V2_COOLDOWN_MIN <= 0:
+    """同方向开腿冷却(分钟); state["v3_last_open"]由rollover每日清理"""
+    if config.V3_COOLDOWN_MIN <= 0:
         return True
-    last = state.get("v2_last_open", {}).get(f"{code}|{side}")
+    last = state.get("v3_last_open", {}).get(f"{code}|{side}")
     if not last:
         return True
     try:
         t0 = datetime.datetime.strptime(f"{now:%Y-%m-%d} {last}", "%Y-%m-%d %H:%M:%S")
-        return (now - t0).total_seconds() >= config.V2_COOLDOWN_MIN * 60
+        return (now - t0).total_seconds() >= config.V3_COOLDOWN_MIN * 60
     except ValueError:
         return True
 
@@ -64,23 +68,23 @@ def _head(name, code, p, pct):
 
 
 def _do_buy(state, code, name, qty, price, note, tags, dry):
-    """v2买入(自动按可用现金缩减); dry只打印; 返回rec或None"""
+    """v3买入(自动按可用现金缩减); dry只打印; 返回rec或None"""
     qty = account.affordable_qty(state, code, price, qty)
     if qty < config.LOT_MIN:
-        print(f"[v2] {name} 现金不足, 放弃买入"
+        print(f"[v3] {name} 现金不足, 放弃买入"
               f"(需约{account.fmt_amt(qty * price)}, 有{account.fmt_amt(state['cash'])})")
         return None
     if dry:
-        print(f"[DRY-v2] 买入 {name} {qty}股@{account.fmt_price(price)} ({note})")
+        print(f"[DRY-v3] 买入 {name} {qty}股@{account.fmt_price(price)} ({note})")
         return None
     return account.execute_buy(state, code, name, qty, price, note=note,
                                strategy_tags=tags)
 
 
 def _do_sell(state, code, name, qty, price, note, tags, dry):
-    """v2卖出(T+1由execute_sell内部拦截昨仓口径); dry只打印"""
+    """v3卖出(T+1由execute_sell内部拦截昨仓口径); dry只打印"""
     if dry:
-        print(f"[DRY-v2] 卖出 {name} {qty}股@{account.fmt_price(price)} ({note})")
+        print(f"[DRY-v3] 卖出 {name} {qty}股@{account.fmt_price(price)} ({note})")
         return None
     return account.execute_sell(state, code, name, qty, price, note=note,
                                 strategy_tags=tags)
@@ -90,12 +94,14 @@ def _do_sell(state, code, name, qty, price, note, tags, dry):
 def _env_of(state, code, plan, q, now):
     """竞价gap/平开弃做/单边下跌/网格间距(与bt_ttrade.daily_base+run_new同源)"""
     td = now.strftime("%Y-%m-%d")
-    envs = state.setdefault("v2_env", {})
+    envs = state.setdefault("v3_env", {})
     env = envs.get(code)
     if env and env.get("date") == td:
         return env
     p = q["price"]
     prev_close = ma20 = atr = None
+    past = []
+    chip_z = None
     try:
         bars = quotes.fetch_kline_bars(code, 101, 80) or []   # 日K(日级缓存)
         past = [b for b in bars if b["dt"][:10] < td]
@@ -108,8 +114,10 @@ def _env_of(state, code, plan, q, now):
                        abs(past[i]["low"] - past[i - 1]["close"]))
                    for i in range(-14, 0)]
             atr = sum(trs) / 14
+        if getattr(config, "V3_CHIP_STALL_EN", False):
+            chip_z = chip.chip_zone(past)   # 筹码密集区(换手衰减, 日级随env缓存)
     except Exception as e:
-        print(f"[v2环境] {code} 日K获取失败(间距/弱势判定降级):", e)
+        print(f"[v3环境] {code} 日K获取失败(间距/弱势判定降级):", e)
     op = None
     try:
         d1 = vote.bars_of_day(quotes.get_bars_1m(code) or [], td)
@@ -122,11 +130,12 @@ def _env_of(state, code, plan, q, now):
     plan_sprd = plan.get("min_spread") or max(0.15, (atr or 0) * config.TP_SPRD_A)
     env = {
         "date": td, "gap": gap, "weak": weak,
-        "flat": abs(gap) < config.V2_GAP_FLAT,
-        "one_way_dn": gap <= config.V2_ONE_WAY_GAP or (weak and gap <= 0),
-        "sprd": max(plan_sprd * config.V2_GRID_SPRD_A,
-                    p * config.V2_GRID_MIN_PCT) if plan_sprd else 0.0,
+        "flat": abs(gap) < config.V3_GAP_FLAT,
+        "one_way_dn": gap <= config.V3_ONE_WAY_GAP or (weak and gap <= 0),
+        "sprd": max(plan_sprd * config.V3_GRID_SPRD_A,
+                    p * config.V3_GRID_MIN_PCT) if plan_sprd else 0.0,
         "prev_close": prev_close, "ma20": ma20, "atr": atr,
+        "chip_lo": (chip_z or {}).get("lo"), "chip_hi": (chip_z or {}).get("hi"),
     }
     envs[code] = env
     tags = []
@@ -134,9 +143,86 @@ def _env_of(state, code, plan, q, now):
         tags.append("平开弃做")
     if env["one_way_dn"]:
         tags.append("单边下跌禁正T")
-    print(f"[v2环境] {plan.get('name', code)} 竞价gap={gap * 100:+.2f}% "
-          f"{' '.join(tags)} 网格间距{env['sprd']:.3f}")
+    chip_txt = ""
+    if env["chip_lo"]:
+        chip_txt = (f" 筹码密集区[{account.fmt_price(env['chip_lo'])}~"
+                    f"{account.fmt_price(env['chip_hi'])}]")
+    print(f"[v3环境] {plan.get('name', code)} 竞价gap={gap * 100:+.2f}% "
+          f"{' '.join(tags)} 网格间距{env['sprd']:.3f}{chip_txt}")
     return env
+
+
+# ---------------- 未成交原因记录(2026-11-11用户需求: 零成交日日报写明原因) ----------------
+def _note_idle(state, code, name, why, now):
+    """记录当日未开腿原因(每轮覆盖last, first保留首次); 今日动过账的股票自动清除"""
+    led = (state.get("today_ledger") or {}).get(code) or {}
+    if led.get("bq") or led.get("sq"):
+        state.setdefault("v3_idle", {}).pop(code, None)   # 今日已做T, 无需原因
+        return
+    rec = state.setdefault("v3_idle", {}).setdefault(
+        code, {"name": name, "first": None, "last": None})
+    ts = now.strftime("%H:%M")
+    if not rec["first"]:
+        rec["first"] = [why, ts]
+    rec["last"] = [why, ts]
+
+
+def _idle_why(state, code, plan, env, p, vwap, dev, late, leg, n_legs,
+              avail, lot, now, pt_today, hot, stable, bull,
+              chip_ctx=None, ml=None):
+    """诊断本轮未开腿原因(优先级: 日级闸门 -> ML日频方向 -> 筹码密集区 -> 反T侧 -> 正T侧)"""
+    if env["flat"]:
+        return (f"竞价平开弃做(gap{env['gap'] * 100:+.2f}%在"
+                f"±{config.V3_GAP_FLAT * 100:.0f}%内), 全日不开新腿")
+    if late:
+        return f"尾盘{config.V3_LATE_GATE}闸门后不开新腿(只兜底闭合)"
+    parts = []
+    if ml == 1 and "sell_low" in plan and hot:
+        parts.append("ML预测涨(日频): 禁反T卖出腿(保上行)")
+    if ml == 0 and "buy_low" in plan:
+        parts.append("ML预测跌(日频): 禁正T买入/网格回补(反T照常, 腿由尾盘兜底)")
+    cx = chip_ctx or {}
+    if cx.get("inside") and cx.get("inside_block"):
+        return "筹码密集区内部(多空胶着无方向), 不开新腿"
+    if "sell_low" in plan:
+        if leg and leg.get("qty", 0) > 0:
+            parts.append("反T腿未闭合不开新腿")
+        elif n_legs >= config.V3_MAX_SELL:
+            parts.append(f"反T已达日上限{config.V3_MAX_SELL}腿")
+        elif avail < config.LOT_MIN:
+            parts.append(f"T+1可卖不足{config.LOT_MIN}股")
+        elif lot < config.LOT_MIN:
+            parts.append(f"单次T量不足{config.LOT_MIN}股")
+        elif not _cool(state, code, "sell", now):
+            parts.append(f"反T开腿冷却中({config.V3_COOLDOWN_MIN}分钟)")
+        elif not hot:
+            gap_hi = (plan["sell_low"] - p) / p * 100
+            dv = f"{dev * 100:+.2f}%" if vwap else "无VWAP"
+            parts.append(f"反T未触发(距高抛区{gap_hi:+.2f}%, VWAP乖离{dv}<"
+                         f"+{config.V3_VWAP_DEV * 100:.0f}%)")
+    if "buy_low" in plan:
+        if env["one_way_dn"]:
+            parts.append(f"单边下跌禁正T(gap{env['gap'] * 100:+.2f}%"
+                         + ("/弱势股" if env["weak"] else "") + ")")
+        elif pt_today:
+            parts.append("正T已开腿(隔日出场)")
+        elif not vwap:
+            parts.append("正T无VWAP数据")
+        elif not _cool(state, code, "buy", now):
+            parts.append(f"正T开腿冷却中({config.V3_COOLDOWN_MIN}分钟)")
+        elif dev > -config.V3_VWAP_DEV:
+            thr = (config.V3_SUPPORT_DEV if cx.get("lower")
+                   else config.V3_VWAP_DEV)
+            parts.append(f"正T未触发(VWAP乖离{dev * 100:+.2f}%需≤"
+                         f"-{thr * 100:.1f}%"
+                         + (", 下沿支撑已放宽" if cx.get("lower") else "") + ")")
+        elif not stable:
+            parts.append("正T超跌未企稳(3根5分钟仍创新低)")
+        elif not bull:
+            parts.append("正T超跌未收阳")
+        elif lot < config.LOT_MIN:
+            parts.append(f"正T量不足{config.LOT_MIN}股")
+    return "; ".join(parts) or "无T区计划"
 
 
 # ---------------- 推送 ----------------
@@ -149,16 +235,16 @@ def _notify_sell_open(state, code, name, q, leg, env, dry):
         return
     p, pct = q["price"], q.get("pct", 0) or 0
     levels = " / ".join(account.fmt_price(leg["sell_price"] - k * env["sprd"])
-                        for k in config.V2_GRID_K)
+                        for k in config.V3_GRID_K)
     notify.send(
-        f"🎯 v2反T卖出·已成交 {name}",
+        f"🎯 v3反T卖出·已成交 {name}",
         "<br>".join([
             _head(name, code, p, pct),
             notify.colored(notify.bold(f"📤 卖出{leg['qty0']}股@"
                                        f"{account.fmt_price(leg['sell_price'])}"),
                            config.C_GREEN),
             f"📐 网格回补计划(各1/3): {levels}",
-            notify.colored(f"🌙 {config.V2_CLOSE_EOD}未回补部分现价兜底闭合",
+            notify.colored(f"🌙 {config.V3_CLOSE_EOD}未回补部分现价兜底闭合",
                            config.C_GRAY),
             _tail(state)]))
 
@@ -170,7 +256,7 @@ def _notify_rebuy(state, code, name, q, leg, gi, rec, env, dry):
     done = sum(1 for f in leg["fills"] if f)
     dev = (leg["sell_price"] - rec["price"]) / leg["sell_price"] * 100
     notify.send(
-        f"🔄 v2网格回补{gi + 1}档·已成交 {name}",
+        f"🔄 v3网格回补{gi + 1}档·已成交 {name}",
         "<br>".join([
             _head(name, code, p, pct),
             notify.colored(notify.bold(f"📥 买入{rec['qty']}股@"
@@ -178,7 +264,7 @@ def _notify_rebuy(state, code, name, q, leg, gi, rec, env, dry):
                                        f"(低于卖价{dev:.2f}%)"), config.C_RED),
             f"📊 本腿已回补{done}/{len(leg['fills'])}档, "
             f"剩余{leg['qty']}股未回补",
-            (notify.colored(f"🌙 剩余部分{config.V2_CLOSE_EOD}兜底闭合",
+            (notify.colored(f"🌙 剩余部分{config.V3_CLOSE_EOD}兜底闭合",
                             config.C_ORANGE) if leg["qty"] > 0 else ""),
             _tail(state)]))
 
@@ -188,13 +274,13 @@ def _notify_pt(state, code, name, q, carry, dev, dry):
         return
     p, pct = q["price"], q.get("pct", 0) or 0
     notify.send(
-        f"🚀 v2正T买入·已成交 {name}",
+        f"🚀 v3正T买入·已成交 {name}",
         "<br>".join([
             _head(name, code, p, pct),
             notify.colored(notify.bold(f"📥 买入{carry['qty']}股@"
                                        f"{account.fmt_price(carry['price'])}"),
                            config.C_RED),
-            f"📉 VWAP乖离{dev * 100:+.1f}%(深于-{config.V2_VWAP_DEV * 100:.0f}%), "
+            f"📉 VWAP乖离{dev * 100:+.1f}%(深于-{config.V3_VWAP_DEV * 100:.0f}%), "
             f"超跌企稳确认(3根5分钟不创新低+收阳)",
             notify.colored("🌅 T+1: 次日开盘出场(隔日T, 含隔夜风险)", config.C_ORANGE),
             _tail(state)]))
@@ -209,7 +295,7 @@ def _notify_carry_exit(state, code, name, q, rec, carry, dry):
                                       f"{account.fmt_pnl(pnl)}(未计费)"),
                           config.C_RED if pnl > 0 else config.C_GREEN))
     notify.send(
-        f"🌅 v2隔日T出场·已卖出 {name}",
+        f"🌅 v3隔日T出场·已卖出 {name}",
         "<br>".join([
             _head(name, code, p, pct),
             f"📤 卖出{rec['qty']}股@{account.fmt_price(rec['price'])} "
@@ -223,7 +309,7 @@ def _notify_fallback(state, code, name, q, rec, leg, dry):
     p, pct = q["price"], q.get("pct", 0) or 0
     dev = (leg["sell_price"] - rec["price"]) / leg["sell_price"] * 100
     notify.send(
-        f"🌙 v2收盘兜底回补·已闭合 {name}",
+        f"🌙 v3收盘兜底回补·已闭合 {name}",
         "<br>".join([
             _head(name, code, p, pct),
             f"📥 兜底买入{rec['qty']}股@{account.fmt_price(rec['price'])} "
@@ -238,20 +324,20 @@ def _notify_stop_alert(state, code, name, q, line, dry):
         return
     p, pct = q["price"], q.get("pct", 0) or 0
     notify.send(
-        f"⚠️ v2止损告警(仅提醒) {name}",
+        f"⚠️ v3止损告警(仅提醒) {name}",
         "<br>".join([
             _head(name, code, p, pct),
             notify.colored(notify.bold(f"🚑 已破止损线 {account.fmt_price(line)}"),
                            config.C_GREEN),
-            notify.colored("v2策略不清仓: 反T网格回补+兜底即T腿风控, 底仓不动",
+            notify.colored("v3策略不清仓: 反T网格回补+兜底即T腿风控, 底仓不动",
                            config.C_GRAY),
-            notify.colored("(需恢复清仓保护请将STRAT_V2_EN置False)", config.C_GRAY),
+            notify.colored("(需恢复清仓保护请将STRAT_V3_EN置False)", config.C_GRAY),
             _tail(state)]))
 
 
-# ---------------- 主入口(被strategy.check_signal在STRAT_V2_EN时调用) ----------------
-def v2_check(state, code, plan, q, now, dry=False, regime=None):
-    """v2策略单股单轮检查; 完全接管该股本轮T动作(v1逻辑不再执行)"""
+# ---------------- 主入口(被strategy.check_signal在STRAT_V3_EN时调用) ----------------
+def v3_check(state, code, plan, q, now, dry=False, regime=None):
+    """v3策略单股单轮检查; 完全接管该股本轮T动作(v1逻辑不再执行)"""
     td = now.strftime("%Y-%m-%d")
     pos = state["positions"].setdefault(
         code, {"name": plan.get("name", code), "shares": 0, "cost": 0.0})
@@ -260,17 +346,23 @@ def v2_check(state, code, plan, q, now, dry=False, regime=None):
     shares = pos["shares"]
     lot = account.lot_of(state, code, shares, plan.get("t_qty"))
     if "sell_low" not in plan and "buy_low" not in plan:
+        _note_idle(state, code, name, "无T区计划(未生成做T区间)", now)
         return True                                  # 无T区计划, 无事可做
+
+    # ── v3 SVM日频方向指导(2026-11-16改日频): 交易日9:00重训 ──
+    #    1=预测涨(禁反T卖, 保上行) / 0=预测跌(禁正T+禁网格回补, 反T照卖) / None=无指导
+    mlp = ml_guide.day_pred(code, td) if getattr(config, "V3_ML_EN", False) else None
 
     env = _env_of(state, code, plan, q, now)
     td_bars = vote.bars_of_day(quotes.get_bars_1m(code) or [], td)
     vwap, _ = vote.calc_vwap(td_bars) if td_bars else (None, None)
     bars5 = vote.agg_bars(td_bars, 5) if td_bars else []
-    late = now.time() >= _hm(config.V2_LATE_GATE)
-    eod = now.time() >= _hm(config.V2_CLOSE_EOD)
+    late = now.time() >= _hm(config.V3_LATE_GATE)
+    eod = now.time() >= _hm(config.V3_CLOSE_EOD)
+    traded = False     # 本轮是否产生T动作(用于未成交原因记录)
 
     # ── ⓪ 昨日正T腿: 开盘出场(T+1已解禁, rollover已清today_bought) ──
-    carry = state.setdefault("v2_carry", {})
+    carry = state.setdefault("v3_carry", {})
     leg_c = carry.get(code)
     if leg_c and leg_c.get("date") != td:
         carry.pop(code, None)                        # 先摘除防出场失败后重复进入
@@ -279,31 +371,32 @@ def v2_check(state, code, plan, q, now, dry=False, regime=None):
             exit_px = (td_bars[0]["open"] if td_bars and td_bars[0].get("open") else p)
             rec = _do_sell(state, code, name, qty, exit_px,
                            note=f"隔日T出场(昨买{account.fmt_price(leg_c['price'])})",
-                           tags="v2隔日T", dry=dry)
+                           tags="v3隔日T", dry=dry)
             if rec:
                 rec["yday_buy"] = leg_c["price"]   # 昨买价: 日报T腿配对明细用(隔日独立配对)
+                traded = True
                 # 昨买腿注入今日台账(2026-11-10): 否则今日总览把隔日T当"多卖未回补",
                 # 隔日利润进不了今日金额, 与累计净T口径对不上
                 account.inject_carry_buy(state, code, rec["qty"], leg_c["price"], dry)
                 _notify_carry_exit(state, code, name, q, rec, leg_c, dry)
         else:
-            print(f"[v2] {name} 隔日T腿{leg_c.get('qty')}股可卖不足, 顺延至下轮")
+            print(f"[v3] {name} 隔日T腿{leg_c.get('qty')}股可卖不足, 顺延至下轮")
 
     # ── 止损线告警(仅提醒不清仓, 防重: 破线告警一次, 收复1%解除) ──
     stops = plan.get("stop_loss") or []
     if stops:
         line = max(stops)
-        skey = f"{code}|v2stop"
+        skey = f"{code}|v3stop"
         if p <= line:
             if skey not in state["armed"]:
                 state["armed"].append(skey)
-                print(f"[v2止损告警] {name} {account.fmt_price(p)} 破止损线"
+                print(f"[v3止损告警] {name} {account.fmt_price(p)} 破止损线"
                       f"{account.fmt_price(line)}(仅提醒, 不清仓)")
                 _notify_stop_alert(state, code, name, q, line, dry)
         elif p >= line * 1.01 and skey in state["armed"]:
             state["armed"].remove(skey)
 
-    legs = state.setdefault("v2_legs", {})
+    legs = state.setdefault("v3_legs", {})
     leg = legs.get(code)
     if leg and leg.get("date") != td:
         leg = None                                   # 隔日残留兜底(rollover应已清)
@@ -312,10 +405,12 @@ def v2_check(state, code, plan, q, now, dry=False, regime=None):
                                if config.T_PLUS_ONE else 0))
 
     # ── ② 网格回补(核心动作, 优先于开新腿): 未回补卖出腿分3档接回 ──
-    if leg and leg.get("qty", 0) > 0 and env["sprd"] > 0:
+    #    v3: ML预测跌周禁回补(不接飞刀), 未回补腿由④尾盘兜底闭合 ──
+    if (leg and leg.get("qty", 0) > 0 and env["sprd"] > 0
+            and not (mlp == 0 and config.V3_ML_BLOCK_GRID)):
         per = max(_std_lot(leg["qty0"] // 3), config.LOT_MIN) \
             if leg["qty0"] >= 300 else leg["qty0"]
-        for gi, k in enumerate(config.V2_GRID_K):
+        for gi, k in enumerate(config.V3_GRID_K):
             if leg["fills"][gi] or leg["qty"] <= 0:
                 continue
             target = leg["sell_price"] - k * env["sprd"]
@@ -324,12 +419,13 @@ def v2_check(state, code, plan, q, now, dry=False, regime=None):
                 rec = _do_buy(state, code, name, want, p,
                               note=f"网格回补{gi + 1}档"
                                    f"(目标{account.fmt_price(target)})",
-                              tags=f"v2回补{gi + 1}", dry=dry)
+                              tags=f"v3回补{gi + 1}", dry=dry)
                 if rec or dry:
                     got = rec["qty"] if rec else want
+                    traded = True
                     leg["fills"][gi] = True
                     leg["qty"] = max(leg["qty"] - got, 0)
-                    print(f"[v2回补] {name} {gi + 1}档 {got}股@"
+                    print(f"[v3回补] {name} {gi + 1}档 {got}股@"
                           f"{account.fmt_price(p)} 剩余{leg['qty']}股未回补")
                     _notify_rebuy(state, code, name, q, leg, gi,
                                   rec or {"qty": got, "price": p}, env, dry)
@@ -337,62 +433,98 @@ def v2_check(state, code, plan, q, now, dry=False, regime=None):
     # ── ④ 收盘兜底(反T闭合纪律): 14:45未回补卖出腿按现价买回 ──
     if eod and leg and leg.get("qty", 0) > 0:
         rec = _do_buy(state, code, name, leg["qty"], p,
-                      note=f"收盘兜底回补({config.V2_CLOSE_EOD}反T闭合纪律)",
-                      tags="v2兜底", dry=dry)
+                      note=f"收盘兜底回补({config.V3_CLOSE_EOD}反T闭合纪律)",
+                      tags="v3兜底", dry=dry)
         if rec:
             leg["qty"] = max(leg["qty"] - rec["qty"], 0)
-            print(f"[v2兜底] {name} 买回{rec['qty']}股@"
+            traded = True
+            print(f"[v3兜底] {name} 买回{rec['qty']}股@"
                   f"{account.fmt_price(p)} 腿剩余{leg['qty']}股")
             _notify_fallback(state, code, name, q, rec, leg, dry)
         elif not dry:
-            print(f"[v2兜底] {name} 现金不足买不回{leg['qty']}股, 下轮重试")
+            print(f"[v3兜底] {name} 现金不足买不回{leg['qty']}股, 下轮重试")
 
-    # ── ① 开卖出腿(反T): 高抛区 或 VWAP上乖离≥2%且5分钟收阳 ──
-    hot = ("sell_low" in plan and p >= plan["sell_low"])
-    if not hot and vwap and bars5:
-        hot = (p / vwap - 1 >= config.V2_VWAP_DEV
-               and bars5[-1]["close"] > bars5[-1]["open"])
-    if (hot and not late and not eod and not env["flat"]
-            and (not leg or leg.get("qty", 0) <= 0)     # 单活跃腿: 未闭合不开新腿
-            and n_legs < config.V2_MAX_SELL
-            and avail >= config.LOT_MIN and lot >= config.LOT_MIN
-            and _cool(state, code, "sell", now)):
-        qty = min(lot, avail)
-        levels = " / ".join(account.fmt_price(p - k * env["sprd"])
-                            for k in config.V2_GRID_K)
-        rec = _do_sell(state, code, name, qty, p,
-                       note=f"反T卖出(网格回补计划: {levels})", tags="v2反T卖",
-                       dry=dry)
-        if rec or dry:                               # dry也建腿(便于观察后续回补计划)
-            leg = {"date": td, "name": name, "sell_price": p, "qty": qty,
-                   "qty0": qty, "fills": [False] * 3, "n_legs": n_legs + 1}
-            legs[code] = leg
-            state.setdefault("v2_last_open", {})[f"{code}|sell"] = \
-                now.strftime("%H:%M:%S")
-            print(f"[v2反T] {name} 卖出{qty}股@{account.fmt_price(p)} "
-                  f"开腿(n_legs={leg['n_legs']}), 网格回补[{levels}]")
-            _notify_sell_open(state, code, name, q, leg, env, dry)
-
-    # ── ③ 正T(超跌反弹确认): 非单边下跌/平开日, VWAP深乖离+企稳收阳, 隔日出 ──
-    pt_today = bool(carry.get(code) and carry[code].get("date") == td)
+    # ── 筹码密集区/滞涨上下文(2026-11-11, V3_CHIP_STALL_EN=False时全部无效) ──
+    chip_en = getattr(config, "V3_CHIP_STALL_EN", False)
+    z_lo, z_hi = env.get("chip_lo"), env.get("chip_hi")
+    edge = config.V3_CHIP_EDGE
+    upper = bool(chip_en and z_hi and p >= z_hi * (1 - edge))     # 触密集区上沿
+    lower = bool(chip_en and z_lo and p <= z_lo * (1 + edge))     # 触密集区下沿
+    inside = bool(chip_en and z_lo and z_hi
+                  and z_lo * (1 + edge) < p < z_hi * (1 - edge))  # 密集区内部
+    ib = chip_en and config.V3_INSIDE_BLOCK    # 内部禁做(回测有害, 默认关)
     dev = (p / vwap - 1) if vwap else 0.0
     stable = (len(bars5) < 6
               or min(b["low"] for b in bars5[-3:])
               >= min(b["low"] for b in bars5[-6:-3]))
     bull = bool(bars5 and bars5[-1]["close"] > bars5[-1]["open"])
+    stall = chip_en and bool(bars5) and chip.stall_shape(bars5)    # 滞涨形态
+
+    # ── ① 开卖出腿(反T): 高抛区 或 VWAP上乖离≥2%且5分钟收阳
+    #    新增: 滞涨形态且(触密集区上沿 或 乖离≥STALL_DEV)也开腿(涨不动先卖) ──
+    hot = ("sell_low" in plan and p >= plan["sell_low"])
+    if not hot and vwap and bars5:
+        hot = (dev >= config.V3_VWAP_DEV and bull)
+    stall_hot = (not hot and chip_en and stall and not (ib and inside)
+                 and (upper or (vwap and dev >= config.V3_STALL_DEV)))
+    if stall_hot:
+        hot = True
+    if (hot and not late and not eod and not env["flat"]
+            and not (mlp == 1 and config.V3_ML_BLOCK_RT)   # v3: 预测涨周禁反T卖(保上行)
+            and not (ib and inside)              # 密集区内部禁做(默认关)
+            and (not leg or leg.get("qty", 0) <= 0)     # 单活跃腿: 未闭合不开新腿
+            and n_legs < config.V3_MAX_SELL
+            and avail >= config.LOT_MIN and lot >= config.LOT_MIN
+            and _cool(state, code, "sell", now)):
+        qty = min(lot, avail)
+        levels = " / ".join(account.fmt_price(p - k * env["sprd"])
+                            for k in config.V3_GRID_K)
+        note = ("反T卖出(滞涨/密集区上沿兑现; " if stall_hot
+                else "反T卖出(") + f"网格回补计划: {levels})"
+        rec = _do_sell(state, code, name, qty, p, note=note, tags="v3反T卖",
+                       dry=dry)
+        if rec or dry:                               # dry也建腿(便于观察后续回补计划)
+            traded = True
+            leg = {"date": td, "name": name, "sell_price": p, "qty": qty,
+                   "qty0": qty, "fills": [False] * 3, "n_legs": n_legs + 1}
+            legs[code] = leg
+            state.setdefault("v3_last_open", {})[f"{code}|sell"] = \
+                now.strftime("%H:%M:%S")
+            print(f"[v3反T] {name} 卖出{qty}股@{account.fmt_price(p)} "
+                  f"开腿(n_legs={leg['n_legs']}), 网格回补[{levels}]")
+            _notify_sell_open(state, code, name, q, leg, env, dry)
+
+    # ── ③ 正T(超跌反弹确认): 非单边下跌/平开日, VWAP深乖离+企稳收阳, 隔日出
+    #    新增: 密集区下沿=强支撑, 触下沿时乖离门槛放宽(2%->SUPPORT_DEV) ──
+    pt_today = bool(carry.get(code) and carry[code].get("date") == td)
+    dev_need = config.V3_SUPPORT_DEV if (chip_en and lower) else config.V3_VWAP_DEV
     if ("buy_low" in plan and not late and not eod
             and not env["flat"] and not env["one_way_dn"] and not pt_today
-            and vwap and dev <= -config.V2_VWAP_DEV and stable and bull
+            and not (mlp == 0 and config.V3_ML_BLOCK_PT)   # v3: 预测跌周禁正T(不接飞刀)
+            and not (ib and inside)              # 密集区内部禁做(默认关)
+            and vwap and dev <= -dev_need and stable and bull
             and lot >= config.LOT_MIN and _cool(state, code, "buy", now)):
         rec = _do_buy(state, code, name, lot, p,
-                      note=f"正T(超跌企稳: VWAP乖离{dev * 100:+.1f}%, 隔日开盘出场)",
-                      tags="v2正T", dry=dry)
+                      note=f"正T(超跌企稳: VWAP乖离{dev * 100:+.1f}%,"
+                           f"{'密集区下沿支撑' if (chip_en and lower) else '标准阈值'}"
+                           f", 隔日开盘出场)",
+                      tags="v3正T", dry=dry)
         if rec or dry:
             got = rec["qty"] if rec else lot
+            traded = True
             carry[code] = {"date": td, "name": name, "price": p, "qty": got}
-            state.setdefault("v2_last_open", {})[f"{code}|buy"] = \
+            state.setdefault("v3_last_open", {})[f"{code}|buy"] = \
                 now.strftime("%H:%M:%S")
-            print(f"[v2正T] {name} 买入{got}股@{account.fmt_price(p)} "
+            print(f"[v3正T] {name} 买入{got}股@{account.fmt_price(p)} "
                   f"(乖离{dev * 100:+.1f}%), 次日开盘出场")
             _notify_pt(state, code, name, q, carry[code], dev, dry)
+
+    # ── 未成交原因记录(2026-11-11用户需求: 零成交日日报需写明原因) ──
+    if traded:
+        state.setdefault("v3_idle", {}).pop(code, None)
+    else:
+        _note_idle(state, code, name, _idle_why(
+            state, code, plan, env, p, vwap, dev, late, leg, n_legs,
+            avail, lot, now, pt_today, hot, stable, bull,
+            chip_ctx={"inside": inside, "inside_block": ib}, ml=mlp), now)
     return True

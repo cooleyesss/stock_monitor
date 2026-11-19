@@ -130,6 +130,14 @@ def load_state():
                         print(f"[基准成本] {p.get('name', c)} orig_cost="
                               f"{p['orig_cost']}(整体累计口径)")
             state.setdefault("cleared_cost", {})   # 清仓时暂存基准成本(接回时恢复)
+            # v2→v3策略改名迁移(2026-11-17): 老状态v2_*字段重命名为v3_*
+            # (v2_carry为正T隔日腿, 跨日保留, 必须迁移; 其余日内字段为陈旧残留, 直接清理)
+            _carry = state.pop("v2_carry", None)
+            if _carry and not state.get("v3_carry"):
+                state["v3_carry"] = _carry
+                print("[迁移] v2_carry -> v3_carry(正T隔日腿跨日保留)")
+            for _k in ("v2_env", "v2_legs", "v2_last_open", "v2_idle"):
+                state.pop(_k, None)
             return state
         except Exception as e:
             print("状态文件损坏, 重新初始化:", e)
@@ -178,13 +186,14 @@ def rollover(state, now, dry=False):
     state["today_vote_log"] = []   # 量化投票信号日志, 每日重置
     state["vote_fail_time"] = {}   # 投票未共振推送冷却, 每日重置
     state["vote_fail_streak"] = {} # 连续失败计数, 每日重置
-    # v2策略(反T编排): 当日环境/腿/冷却重置; 正T隔日腿v2_carry跨日保留(次日开盘出场)
-    state.pop("v2_env", None)
-    for _c, _lg in (state.pop("v2_legs", {}) or {}).items():
+    # v3策略(反T编排): 当日环境/腿/冷却重置; 正T隔日腿v3_carry跨日保留(次日开盘出场)
+    state.pop("v3_env", None)
+    for _c, _lg in (state.pop("v3_legs", {}) or {}).items():
         if isinstance(_lg, dict) and _lg.get("qty", 0) > 0:
-            print(f"[v2] {_lg.get('name', _c)} 未回补卖出腿残留{_lg['qty']}股"
+            print(f"[v3] {_lg.get('name', _c)} 未回补卖出腿残留{_lg['qty']}股"
                   f"(14:45兜底未成交, 多为现金不足), 残腿放弃回补")
-    state.pop("v2_last_open", None)
+    state.pop("v3_last_open", None)
+    state.pop("v3_idle", None)   # v3未成交原因记录(2026-11-11), 每日重置
     for pos in state["positions"].values():
         pos.pop("today_bought", None)   # T+1: 隔夜今仓变昨仓
     save_state(state, dry)

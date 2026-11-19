@@ -1,4 +1,4 @@
-﻿﻿# unified starter: monitor + sim trading (dedup + hidden background)
+﻿# unified starter: monitor + sim trading (dedup + hidden background)
 # 2026-11-05 重构进程识别: 本机 CIM 查询 CommandLine 为空, 旧正则匹配失效
 # (导致 15:15 stop 杀不掉监控进程, 残留至次日会双进程重复推送)
 # 新机制: Start-Process -PassThru 直接拿 PID 落盘 data\pids\*.pid(格式 PID|启动时间),

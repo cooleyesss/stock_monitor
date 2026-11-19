@@ -520,14 +520,14 @@ def _handle_zone_touch(state, code, name, side, q, plan, lot, ind, now, dry):
 
 # ---------------- 每轮信号检查 ----------------
 def check_signal(state, code, plan, q, now, dry=False, regime=None):
-    # ── v2策略(2026-10-30): 反T编排+网格回补+环境过滤+收盘兜底, 完全接管本轮T动作 ──
+    # ── v3策略(基础编排2026-10-30, 2026-11-13并入SVM方向指导): 反T编排+网格回补+环境过滤+收盘兜底, 完全接管本轮T动作 ──
     # 异常时不降级v1(防同日双策略动账), 只跳过本轮下轮重试
-    if getattr(config, "STRAT_V2_EN", False):
-        from ttrade import ttrade_v2
+    if getattr(config, "STRAT_V3_EN", False):
+        from ttrade import ttrade_v3
         try:
-            ttrade_v2.v2_check(state, code, plan, q, now, dry, regime)
+            ttrade_v3.v3_check(state, code, plan, q, now, dry, regime)
         except Exception as e:
-            print(f"[v2异常] {plan.get('name', code)} 本轮跳过(不降级v1防双跑):", e)
+            print(f"[v3异常] {plan.get('name', code)} 本轮跳过(不降级v1防双跑):", e)
         return
     p, vr = q["price"], q["vr"]
     pos = state["positions"].setdefault(
@@ -809,6 +809,8 @@ def do_eod(state, now, dry=False):
         print(f"日内T看板 -> {dp}")
     except Exception as e:
         print("[日内T看板] 生成失败:", e)
+    # v3(2026-11-16改日频): SVM方向预测已移至交易日9:00主循环重训(runner),
+    # 收盘日跑不再训练; 8:45新闻雷达隔夜汇总 -> 9:00训练 -> 9:26 t_plan参考。
     return True
 
 

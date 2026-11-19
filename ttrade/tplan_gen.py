@@ -212,6 +212,31 @@ def _gap_fine_shift(row, code, atr, last_close, now):
     return notes or [f"竞价平开{gap_pct:+.1f}% 不调整"]
 
 
+def _ml_news_note(code, now):
+    """v3(2026-11-16 因子E): 注入SVM今日方向+隔夜新闻雷达评分到计划说明
+    仅展示参考(不改价位); 实际闸门在交易层ttrade_v3生效"""
+    parts = []
+    td = now.strftime("%Y-%m-%d")
+    try:
+        from ttrade import ml_guide
+        p = ml_guide.day_pred(code, td) \
+            if getattr(config, "V3_ML_EN", False) else None
+        if p == 1:
+            parts.append("ML今日看涨(正T为主,已禁反T卖)")
+        elif p == 0:
+            parts.append("ML今日看跌(反T为主,已禁正T+回补)")
+    except Exception:
+        pass
+    try:
+        from ttrade import news_radar
+        sc, hits = news_radar.score_at(code, td)
+        if hits:
+            parts.append(f"隔夜新闻{('+' + str(sc)) if sc > 0 else sc}分({hits}条)")
+    except Exception:
+        pass
+    return parts
+
+
 def generate_daily_plan(now=None, dry=False):
     """9:26 入口: 四因子重算并覆盖写内部 t_plan.csv; 返回说明汇总list
     时点=9:26:00(集合竞价9:25撮合完, 行情快照~9:25:30稳定, 9:26数据最完整)"""
@@ -260,6 +285,7 @@ def generate_daily_plan(now=None, dry=False):
             notes += _mkt_shift(row, mkt_pct, atr)                     # 因子B
             notes += _gap_fine_shift(row, code, atr, last_close, now)  # 因子C(9:26多档细分)
             notes += _news_shift(row, code, atr)                       # 因子D
+            notes += _ml_news_note(code, now)                          # 因子E(v3参考)
         except Exception as e:
             print(f"[t_plan] {name}({code}) 生成异常, 保留原价位:", e)
             notes = [f"生成异常保留原价位: {e}"]

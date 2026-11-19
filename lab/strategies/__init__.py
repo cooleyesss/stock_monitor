@@ -17,6 +17,7 @@ from lab.strategies.part_sell import PartSellStrategy
 from lab.strategies.scale_in import ScaleInStrategy
 from lab.strategies.break_even import BE5, BE8
 from lab.strategies.combo_v3 import ComboStrategy, Scale50, Scale70
+from lab.strategies.ml_svm import MlSvmStrategy
 
 REGISTRY = {
     "prod": ProdStrategy,
@@ -40,4 +41,5 @@ REGISTRY = {
     "combo": ComboStrategy,
     "scale50": Scale50,
     "scale70": Scale70,
+    "ml_svm": MlSvmStrategy,
 }

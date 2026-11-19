@@ -67,12 +67,20 @@ def in_window(now):
 
 
 def seconds_to_next_window(now):
-    """距下一个交易窗口开始的秒数(用于精确休眠); 窗口内返回0
-    午休睡到13:00, 收盘后睡到下一个工作日9:30"""
+    """距下一个"需要醒来的时点"秒数(用于精确休眠); 窗口内返回0
+    醒来时点(2026-11-16新闻雷达+SVM日频): 8:45(隔夜新闻汇总) / 9:00(ML日频重训)
+    / 9:25(t_plan生成竞价) / 9:30开盘 / 13:00午休结束; 收盘后睡到下一工作日8:45
+    (监控进程15:15起不再被stop.ps1杀死, 过夜存活供次日早间雷达/训练)"""
     if now.weekday() >= 5:
         return config.IDLE_SLEEP_SECONDS
     t = now.time()
-    if t < datetime.time(9, 30):
+    if t < datetime.time(8, 45):
+        target = datetime.datetime.combine(now.date(), datetime.time(8, 45))
+    elif t < datetime.time(9, 0):
+        target = datetime.datetime.combine(now.date(), datetime.time(9, 0))
+    elif t < datetime.time(9, 25):
+        target = datetime.datetime.combine(now.date(), datetime.time(9, 25))
+    elif t < datetime.time(9, 30):
         target = datetime.datetime.combine(now.date(), datetime.time(9, 30))
     elif datetime.time(11, 30) < t < datetime.time(13, 0):
         target = datetime.datetime.combine(now.date(), datetime.time(13, 0))
@@ -80,7 +88,7 @@ def seconds_to_next_window(now):
         d = now.date() + datetime.timedelta(days=1)
         while d.weekday() >= 5:
             d += datetime.timedelta(days=1)
-        target = datetime.datetime.combine(d, datetime.time(9, 30))
+        target = datetime.datetime.combine(d, datetime.time(8, 45))
     else:
         return 0
     return max(1.0, (target - now).total_seconds())
@@ -221,9 +229,12 @@ def main():
     quant_mode = ("多策略投票共振"
                   + (" [观察模式:共振通过不成交]" if config.STRATEGY_DRY_RUN else "")
                   if config.QUANT_ENABLED else "关闭(旧逻辑)")
-    strat_mode = ("v2反T编排(网格回补+环境过滤+收盘兜底)" if config.STRAT_V2_EN
+    strat_mode = ("v3策略(反T编排+网格回补+环境过滤+收盘兜底)" if config.STRAT_V3_EN
                   else "v1区间+量化投票+AI守门")
+    if config.STRAT_V3_EN and getattr(config, "V3_ML_EN", False):
+        strat_mode += " + SVM日频方向指导(交易日9:00重训, 涨禁反T/跌禁正T与回补)"
     print(f"刷新{config.REFRESH_SECONDS}秒 | 交易时段 工作日9:30-11:30/13:00-15:00 | "
+          f"8:45新闻雷达隔夜汇总 | 9:00 SVM日频重训 | "
           f"15:15收盘战报 | 止损模式:{config.STOP_LOSS_MODE} | "
           f"做T股数=当日持仓1/3 | AI(DeepSeek): {ai_mode} | "
           f"量化引擎: {quant_mode}")
@@ -237,10 +248,33 @@ def main():
     last_snapshot = None
     last_plan_mtime = None
     last_auction_date = None
+    last_brief_date = None
+    last_ml_date = None
     while True:
         now = datetime.datetime.now()
         try:
             tstate.rollover(state, now)
+            # 8:45 新闻雷达隔夜汇总(每日一次): 上一交易日收盘以来快讯 ->
+            # LLM板块/持仓打分 -> 微信推送 + 存档(供9:00 SVM特征与9:26 t_plan参考)
+            if (now.weekday() < 5 and last_brief_date != now.date()
+                    and datetime.time(8, 40) <= now.time() < datetime.time(9, 10)):
+                try:
+                    from ttrade import news_radar
+                    news_radar.morning_brief(now, state,
+                                             tstate.load_t_plan(), DRY_RUN)
+                    last_brief_date = now.date()
+                except Exception as e:
+                    print("[新闻雷达] 隔夜汇总失败(不影响主流程):", e)
+            # 9:00 SVM日频重训(每日一次, 幂等): 3个月日线+隔夜新闻分 -> 今日方向
+            # (窗口放宽到9:28: 监控进程若隔夜崩溃, 9:25计划任务重启后仍能补训)
+            if (now.weekday() < 5 and last_ml_date != now.date()
+                    and datetime.time(9, 0) <= now.time() < datetime.time(9, 28)):
+                try:
+                    from ttrade import ml_guide
+                    ml_guide.train_day(state, tstate.load_t_plan(), now, DRY_RUN)
+                    last_ml_date = now.date()
+                except Exception as e:
+                    print("[ML日预测] 训练失败(不影响主流程):", e)
             # 9:26 集合竞价自动更新 t_plan (每日仅触发一次)
             if (now.weekday() < 5 and last_auction_date != now.date()
                     and datetime.time(9, 25) <= now.time() <= datetime.time(9, 30)):
@@ -275,6 +309,17 @@ def main():
                     last_plan_mtime = plan_mtime
                     notify.send("🔄 做T策略已更新", strategy.format_t_plan(tstate.load_t_plan()))
                 run_cycle(state, now)
+                # 新闻雷达盘中轮询(2026-11-16): 行情轮询间隙每NEWS_POLL_SEC秒拉一次
+                # 快讯, 重大级秒级微信告警(只观察不交易); 失败安全不影响行情主循环
+                radar_codes = collect_codes(state, tstate.load_t_plan())
+                t_end = time.time() + config.REFRESH_SECONDS
+                while time.time() < t_end - 5:
+                    time.sleep(min(config.NEWS_POLL_SEC, max(1, t_end - 5 - time.time())))
+                    try:
+                        from ttrade import news_radar
+                        news_radar.poll(datetime.datetime.now(), radar_codes)
+                    except Exception as e:
+                        print("[新闻雷达] 盘中轮询失败(跳过本轮):", e)
                 # 常规快照(默认关闭)
                 if config.SNAPSHOT_MINUTES > 0 and (
                         last_snapshot is None or
@@ -284,7 +329,7 @@ def main():
                                 strategy.format_snapshot(quotes.fetch_quotes(
                                     collect_codes(state, tplan))))
                     last_snapshot = now
-                time.sleep(config.REFRESH_SECONDS)
+                time.sleep(5)          # 雷达子循环已等待整轮REFRESH_SECONDS, 只留小间隙
             else:
                 # 收盘报告未发出(失败重试中) -> 短睡等待重试; 否则精确睡到下一窗口
                 if now.weekday() < 5 and now.time() >= datetime.time(15, 0) \
