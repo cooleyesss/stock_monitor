@@ -18,7 +18,7 @@ from common import notify, quotes
 from core import adaptive
 from core.indicators import build_ind
 from quant import picker
-from quant import account, dashboard
+from quant import account, dashboard, estim
 
 KLT_DAILY, BARS_LMT = 101, 120      # 日K, 120根(覆盖MA60+动量)
 _ACT_LABEL = {"SELL": ("🔴卖出", config.C_GREEN),
@@ -361,7 +361,7 @@ def _rebalance(state, rep_date, cal, dry, idx_bars=None, scan=None):
 
 
 def _pool_entry(p, rep_date):
-    """候选池条目(剥离bars大对象, 只留展示/排序字段; v3含多因子分与因子值)"""
+    """候选池条目(剥离bars大对象, 只留展示/排序字段; v4含多因子分/因子值/截面z分)"""
     return {"code": p["code"], "name": p["name"],
             "board_kind_cn": p.get("board_kind_cn", ""),
             "board_name": p.get("board_name", ""),
@@ -369,14 +369,24 @@ def _pool_entry(p, rep_date):
             "board_mom": p.get("board_mom", 0.0),
             "mom": p["mom"], "close": p["close"],
             "score": p.get("score"), "m120": p.get("m120"),
+            "mom20": p.get("mom20"),
             "r5": p.get("r5"), "bias": p.get("bias"), "vol20": p.get("vol20"),
+            "vr": p.get("vr"),
+            "z_m120": p.get("z_m120"), "z_mom20": p.get("z_mom20"),
+            "z_vol20": p.get("z_vol20"), "z_bias": p.get("z_bias"),
+            "z_vr": p.get("z_vr"),
+            "first_close": p["close"],          # v5: 入池首日收盘价(入池后涨跌基准)
+            "res1": p.get("res1"), "res2": p.get("res2"),   # v5: 压力位/强压力
+            "sup1": p.get("sup1"), "sup2": p.get("sup2"),   # v5: MA20支撑/强支撑
+            "pct_chg": p.get("pct_chg"),        # v5: 当日涨跌
             "reason": p.get("reason", ""),
             "extreme": p.get("extreme", False),
             "first_date": rep_date, "last_date": rep_date, "hits": 1}
 
 
 def _pool_upsert(state, passing, rep_date):
-    """过门槛候选入池/刷新(动量/close/板块/extreme/多因子分更新, hits累计上榜次数)"""
+    """过门槛候选入池/刷新(动量/close/板块/extreme/多因子分/因子值/截面z分更新,
+    hits累计上榜次数)"""
     pool = state.setdefault("cand_pool", {})
     for p in passing:
         c = p["code"]
@@ -391,9 +401,21 @@ def _pool_upsert(state, passing, rep_date):
                       "extreme": p.get("extreme", e.get("extreme", False)),
                       "score": p.get("score", e.get("score")),
                       "m120": p.get("m120", e.get("m120")),
+                      "mom20": p.get("mom20", e.get("mom20")),
                       "r5": p.get("r5", e.get("r5")),
                       "bias": p.get("bias", e.get("bias")),
                       "vol20": p.get("vol20", e.get("vol20")),
+                      "vr": p.get("vr", e.get("vr")),
+                      "z_m120": p.get("z_m120", e.get("z_m120")),
+                      "z_mom20": p.get("z_mom20", e.get("z_mom20")),
+                      "z_vol20": p.get("z_vol20", e.get("z_vol20")),
+                      "z_bias": p.get("z_bias", e.get("z_bias")),
+                      "z_vr": p.get("z_vr", e.get("z_vr")),
+                      "pct_chg": p.get("pct_chg", e.get("pct_chg")),
+                      "res1": p.get("res1", e.get("res1")),
+                      "res2": p.get("res2", e.get("res2")),
+                      "sup1": p.get("sup1", e.get("sup1")),
+                      "sup2": p.get("sup2", e.get("sup2")),
                       "reason": p.get("reason", e.get("reason", "")),
                       "last_date": rep_date})
             e["hits"] += 1
@@ -473,6 +495,16 @@ def _daily_pool_scan(state, rep_date, cal, dry, sel=None):
         try:
             res = picker.select(held=held, cool_dates=state.get("last_sell", {}))
             passing = res.get("passing") or []
+            if res and res.get("note"):
+                print("[量化] 候选池扫描未完成:", res["note"])
+                account.append_log(f"{rep_date} 候选池扫描未完成: "
+                                   f"{res['note']}", dry=dry)
+            elif res is not None and res.get("cand_n") == 0:
+                # 盘前东财clist实时价格字段为空 -> 成分股全被过滤, 宇宙为0
+                print("[量化] 候选池扫描宇宙为空(疑似盘前无实时行情), "
+                      "本轮池未刷新")
+                account.append_log(f"{rep_date} 候选池扫描宇宙为空"
+                                   f"(疑似盘前无实时行情), 池未刷新", dry=dry)
         except Exception as e:
             print("[量化] 每日候选池扫描失败:", e)
             account.append_log(f"{rep_date} 候选池扫描失败: {e}", dry=dry)
@@ -773,10 +805,88 @@ def _sel_section(sel, state):
     return body
 
 
-def _pool_section(obs, state, cal, rep_date):
+# v4因子展示定义: (字段key, 展示名, 权重key, 原始值格式)
+_V4_FACTS = (("m120", "中期动量", "mom", "{:+.0%}"),
+             ("mom20", "短期反转", "rev", "{:+.0%}"),
+             ("vol20", "低波动", "vol", "{:.1%}"),
+             ("bias", "回踩位置", "pull", "{:+.1%}"),
+             ("vr", "量比", "vr", "{:.2f}"))
+
+
+def _zbar_html(z, half=30, vmax=2.5, h=9):
+    """z-score双侧图形条(邮件HTML安全, 仿图片'候选评分总览'):
+    中心线左负(绿)右正(红), |z|超vmax截断; z缺失画空条"""
+    z = 0.0 if z is None else max(-vmax, min(vmax, z))
+    pct = z / vmax
+    neg = int(round(half * -pct)) if pct < 0 else 0
+    pos = int(round(half * pct)) if pct > 0 else 0
+
+    def _td(bg, w):
+        return (f"<td bgcolor='{bg}' width='{w}' height='{h}' "
+                f"style='font-size:0;line-height:{h}px'></td>")
+
+    return ("<table cellspacing='0' cellpadding='0' "
+            "style='border-collapse:collapse;display:inline-block;"
+            "vertical-align:middle'><tr>"
+            + _td("#eaf3ea", half - neg) + _td("#00a800", neg)
+            + _td("#666666", 1) + _td("#e60000", pos)
+            + _td("#f7e8e8", half - pos) + "</tr></table>")
+
+
+def _zcell(z):
+    """主表z分单元格: 红=正贡献 绿=负贡献 灰=中性/缺失"""
+    if z is None:
+        return notify.colored("-", config.C_GRAY)
+    c = (config.C_RED if z > 0.05 else
+         config.C_GREEN if z < -0.05 else config.C_GRAY)
+    return notify.colored(f"{z:+.2f}", c)
+
+
+def _v4_pos_tag(e):
+    """位置档位标签(仿图片): 按收盘距MA20乖离分档"""
+    b = e.get("bias")
+    if b is None:
+        return ""
+    if b <= 0.05:
+        return "[回踩确认]"
+    return "[中位]" if b <= 0.10 else "[近新高]"
+
+
+def _scorecard(e):
+    """单候选逐因子打分明细表(仿图片'候选评分总览'):
+    原始值 + z分图形条 + 截面z分 + 权重 + 贡献分, 合计=综合分"""
+    w = config.PICK_V3_W
+    rows = []
+    for fk, fn, wk, fmt in _V4_FACTS:
+        raw, z = e.get(fk), e.get("z_" + fk)
+        raw_txt = fmt.format(raw) if raw is not None else "-"
+        wt = w.get(wk, 0.0)
+        if z is None:
+            zc, cc = notify.colored("-", config.C_GRAY), "-"
+        else:
+            zc = _zcell(z)
+            cc = notify.colored(f"{wt * z:+.2f}",
+                                config.C_RED if wt * z > 0 else config.C_GREEN)
+        rows.append([fn, raw_txt, _zbar_html(z), zc, f"{wt:g}", cc])
+    total = e.get("score")
+    rows.append([notify.bold("综合分"), "", "", "", "",
+                 notify.bold(f"{total:+.2f}") if total is not None else "-"])
+    return notify.table(["因子", "原始值", "评分图形", "截面z分", "权重", "贡献分"],
+                        rows)
+
+
+def _pool_section(obs, state, cal, rep_date, menv=None):
     """日报"候选观察池"节(用户规则②③: 每日扫描累积入池, 每日给出池内择优,
-    调仓日按池内择优实际建仓; 排序方向看连板行情)"""
+    调仓日按池内择优实际建仓; 排序方向看连板行情)
+    v5估算层(2026-11-19): 主表新增当日情况/支撑压力/入池涨跌列, 择优Top3附入仓时机;
+    PICK_V5_EN=False时回纯v4展示口径(位置标签挂名称, 无价位/时机)"""
     snap, obs_best, zt_on = obs[0], obs[1], obs[2]
+    v5 = config.PICK_V5_EN
+    gate_open = True                       # v5门控状态(从menv大盘快照推, 缺失fail-open)
+    if v5 and config.PICK_V3_EN and config.PICK_V3_GATE_MA and menv:
+        ix = menv.get("idx") or {}
+        if ix.get("ma20") and ix.get("close"):
+            gate_open = ix["close"] > ix["ma20"]
     body = notify.sec("候选观察池(每日累积 · 调仓日择优建仓)")
     if not snap:
         return body + notify.colored(
@@ -785,8 +895,10 @@ def _pool_section(obs, state, cal, rep_date):
     held = {c for c, a in state["accounts"].items() if a["sh"] > 0}
     v3 = config.PICK_V3_EN
     rows = []
-    for e in snap:
+    for e in snap[:12]:
         nm = f"{e['name']}({e['code']})"
+        if v3 and e.get("score") is not None and not v5:
+            nm += notify.colored(_v4_pos_tag(e), config.C_GRAY)   # v4归档口径
         if e["code"] in held:
             nm += notify.colored(" [已持仓]", config.C_GRAY)
         if _pool_cool(state, e["code"], cal, rep_date):
@@ -799,15 +911,54 @@ def _pool_section(obs, state, cal, rep_date):
         sc = (notify.colored(f"{e['score']:+.2f}", config.C_RED)
               if v3 and e.get("score") is not None
               else notify.colored(f"{e['mom'] * 100:+.1f}%", config.C_RED))
-        rows.append([nm, e.get("board_disp")
-                     or f"{e['board_kind_cn']}·{e['board_name']}",
-                     sc,
-                     f"{e['close']:.3f}",
-                     f"{days}日" if days is not None else "-",
-                     str(e["hits"])])
-    body += notify.table(
-        ["候选(按多因子分)" if v3 else "候选(按动量)", "所属板块",
-         "多因子分" if v3 else "动量", "现价", "入池", "上榜"], rows)
+        r = [nm, e.get("board_disp")
+             or f"{e['board_kind_cn']}·{e['board_name']}", sc]
+        if v3:
+            r += [_zcell(e.get("z_" + k))
+                  for k in ("m120", "mom20", "vol20", "bias", "vr")]
+        r += [f"{e['close']:.3f}"]
+        if v5:
+            # 当日情况列(仿图片位置列): 位置档位+当日涨跌+量能状态
+            bits = []
+            st = estim.pos_state(e)
+            if st:
+                bits.append(f"[{st}]")
+            pc = e.get("pct_chg")
+            if pc is not None:
+                bits.append(notify.colored(
+                    f"{pc:+.1%}", config.C_RED if pc > 0 else config.C_GREEN))
+            vs = estim.vol_state(e)
+            if vs:
+                bits.append(vs)
+            r.append(" ".join(bits) or "-")
+            # 支撑/压力列: 绿支撑(MA20) 红压力(20日高)
+            sup1, res1 = e.get("sup1"), e.get("res1")
+            r.append((notify.colored(f"{sup1:.2f}", config.C_GREEN) if sup1
+                      else notify.colored("-", config.C_GRAY))
+                     + "/"
+                     + (notify.colored(f"{res1:.2f}", config.C_RED) if res1
+                        else notify.colored("-", config.C_GRAY)))
+            # 入池涨跌列: 入池首日收盘 -> 最近刷新日收盘(旧条目无first_close显示-)
+            fc = e.get("first_close")
+            cum = (e["close"] / fc - 1) if fc else None
+            cum_txt = (notify.colored(f"{cum:+.1%}",
+                                      config.C_RED if cum > 0 else config.C_GREEN)
+                       if cum is not None else "-")
+            r.append(f"{days}日 {cum_txt}" if days is not None else cum_txt)
+        else:
+            r += [f"{days}日" if days is not None else "-"]
+        r += [str(e["hits"])]
+        rows.append(r)
+    heads = (["候选(按多因子分)", "所属板块", "综合分", "动量z", "反转z", "低波z",
+              "回踩z", "量比z", "现价", "当日情况", "支撑/压力", "入池涨跌", "上榜"]
+             if v3 and v5 else
+             ["候选(按多因子分)", "所属板块", "综合分", "动量z", "反转z", "低波z",
+              "回踩z", "量比z", "现价", "入池", "上榜"] if v3 else
+             ["候选(按动量)", "所属板块", "动量", "现价", "入池", "上榜"])
+    body += notify.table(heads, rows)
+    if len(snap) > 12:
+        body += notify.colored(f"(仅展示池内Top12, 另有{len(snap) - 12}只候选)",
+                               config.C_GRAY)
     if obs_best:
         txt = "、".join(f"{e['name']}({e['score']:+.2f})" if v3 and e.get("score") is not None
                         else f"{e['name']}({e['mom'] * 100:+.1f}%)" for e in obs_best)
@@ -815,14 +966,36 @@ def _pool_section(obs, state, cal, rep_date):
         txt = "无(池内候选均在持仓/冷却中)"
     body += notify.colored(f"当前池内择优(调仓日按此实际建仓): {txt}", config.C_RED)
     if v3:
-        for e in obs_best[:3]:
-            if e.get("reason"):
-                body += notify.colored(f"{e['name']}: {e['reason']}", config.C_GRAY)
-    if v3:
+        for i, e in enumerate(obs_best[:3], 1):
+            if e.get("score") is None or e.get("z_vr") is None:
+                if e.get("reason"):
+                    body += notify.colored(f"{e['name']}: {e['reason']}",
+                                           config.C_GRAY)
+                continue
+            body += (notify.colored(f"#{i} {e['name']}({e['code']}) ",
+                                    config.C_RED)
+                     + notify.colored(f"综合分{e['score']:+.2f}", config.C_GRAY)
+                     + notify.colored(_v4_pos_tag(e) or "-", config.C_GRAY)
+                     + notify.colored(f" · {e.get('reason', '')}",
+                                      config.C_GRAY))
+            body += _scorecard(e)
+            if v5:
+                plan = estim.entry_plan(e, gate_open=gate_open)
+                if plan:
+                    body += notify.colored(f"入仓时机(v5·信息层): {plan}",
+                                           config.C_ORANGE)
+        _w = config.PICK_V3_W
         body += notify.colored(
-            "排序口径: v3多因子分(中期动量+短期反转+低波+回踩乖离, 高→低), "
-            "极端标的沉底, 只认当日扫描快照; "
-            f"保鲜期{config.PICK_POOL_KEEP}个交易日, 超龄自动出池", config.C_GRAY)
+            "评分口径: v4多因子分=Σ(权重×截面z分), 权重 中期动量"
+            f"{_w['mom']:g}/短期反转{_w['rev']:g}/低波动{_w['vol']:g}/"
+            f"回踩位置{_w['pull']:g}/量比{_w.get('vr', 0):g}"
+            "(2026-11-18图片策略融合定版); 评分图形=截面z分"
+            "(中心线左负右红正, ±2.5截断); 极端标的沉底, 只认当日扫描快照; "
+            f"保鲜期{config.PICK_POOL_KEEP}个交易日, 超龄自动出池"
+            + ("; v5估算层: 当日情况=位置档位+涨跌+量能(vr≥1.1放量/<0.85缩量), "
+               "支撑=MA20/压力=20日高, 入池涨跌=入池首日收盘→最近刷新日收盘, "
+               "入仓时机为信息层建议·不参与自动决策"
+               if v5 else ""), config.C_GRAY)
     else:
         body += notify.colored(
             f"排序口径: {'连板行情(妖股/连板股优先)' if zt_on else '非连板行情(极端标的沉底)'}, "
@@ -1094,17 +1267,21 @@ def build_report(state, fills, last_closes, rep_date, sel=None, stale=None, plan
             ["标的", "明日动作", "计划与触发条件"], plans)
     body += _sel_section(sel, state)
     if obs is not None:
-        body += _pool_section(obs, state, cal, rep_date)
+        body += _pool_section(obs, state, cal, rep_date, menv=menv)
     if menv is not None:
         body += _mkt_env_section(menv)
     body += (notify.sec("口径")
              + notify.colored(
-                 ("v3多因子机构路线(2026-11-04回测重构, bt_quant_v3.py: 286日+126.4%/MDD-11.6%) | "
+                 ("v4多因子机构路线(2026-11-18图片策略融合定版, bt_quant_v3.py三轮回测: "
+                  "全窗口286日+169%/MDD-11.6%/胜率46.7%, 半年熊市窗口+20.7%不败) | "
                   "选股=全市场行业板成分股, 门槛'趋势内回调'(收盘>MA20/60且MA20上行, 120日跳段动量≥0, "
-                  "乖离≤15%, 5日≤6%, 20日≤45%), 四因子z-score打分(0.5中期动量+1短期反转+1低波+0.5回踩"
-                  "乖离)取TopK | 退出=阶梯止盈+阶梯止损+吊灯止损(22日最高收盘-2×ATR14)先到先卖, "
+                  "乖离≤15%, 5日≤6%, 20日≤45%), 五因子z-score打分(0.5中期动量+1短期反转+1低波+0.5回踩"
+                  "乖离+0.5量比)取TopK | 退出=阶梯止盈+阶梯止损+吊灯止损(22日最高收盘-2×ATR14)先到先卖, "
                   "空仓不自动重入(入场只走调仓日选股挂单; 特别好机会可忽略调仓日与冷却期临时建仓) | "
-                  "大盘门控: 上证收盘<MA20暂停新开仓 | ")
+                  "大盘门控: 上证收盘<MA20暂停新开仓 | "
+                  + ("v5估算层(2026-11-19): 压力/支撑位+回踩确认档+入仓时机为信息层, "
+                     "不参与自动决策, 时机=支撑MA20上方企稳低吸/放量突破压力跟随 | "
+                     if config.PICK_V5_EN else ""))
                  if config.PICK_V3_EN else
                  ("v2.5双模策略 | 每股独立子账户, 趋势腿满仓买入, 阶梯止盈(浮盈<15%带宽6%/"
                   "15~30%带10%/≥30%带15%)+阶梯止损(浮盈<25%线-12%/25~50%线+3%/≥50%线+10%)+MA10破位"

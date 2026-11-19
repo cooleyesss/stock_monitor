@@ -14,6 +14,7 @@ import time
 import config_quant as config
 from common import quotes
 from core.indicators import build_ind
+from quant import estim
 
 
 def hot_boards(kind, lookback=None, scan=None, m=None, mom_min=None, deadline=None):
@@ -434,7 +435,8 @@ def _select_reson(held, cool_dates, lookback, topk, deadline):
     return res
 
 
-# ---------------- v3 机构多因子模式(2026-11-04 回测重构, PICK_V3_EN=True 启用) ----------------
+# ---------------- v4 机构多因子模式(2026-11-18图片策略融合定版, PICK_V4_EN=True启用;
+#   v3管线+vr量比因子, 三轮回测依据见config_quant.py PICK_V3_W注释) ----------------
 # 与旧模式差异(全部与 bt_quant_v3.py 回测逐句同口径):
 #   宇宙: 全市场行业板块(~86个)成分股按成交额前15, 替代"热门板块预筛"
 #         (多因子打分自带截面择优, 无需板块动量预筛; 回测已含该差异)
@@ -464,6 +466,10 @@ def _v3_factors(bars):
     rs = [closes[k] / closes[k - 1] - 1 for k in range(j - 19, j + 1)]
     m = sum(rs) / 20
     vol20 = (sum((x - m) ** 2 for x in rs) / 20) ** 0.5
+    # vr量比(2026-11-18采纳, 与bt_quant_v3.snap同口径): 近5日均量/20日均量
+    v20 = sum(b["vol"] for b in bars[j - 19:j + 1])
+    vr = ((sum(b["vol"] for b in bars[j - 4:j + 1]) / 5.0) / (v20 / 20.0)
+          if v20 > 0 else 1.0)
     if not (cl > ma20 and cl > ma60 and ma20up
             and m120 >= config.PICK_V3_MOM_MIN
             and bias <= config.PICK_V3_BIAS_MAX
@@ -471,7 +477,7 @@ def _v3_factors(bars):
             and mom20 <= config.PICK_V3_R20_MAX):
         return False, "门槛未达", None
     return True, "", {"m120": m120, "mom20": mom20, "r5": r5,
-                      "bias": bias, "vol20": vol20}
+                      "bias": bias, "vol20": vol20, "vr": vr}
 
 
 def _zscore_v3(cands, extra=()):
@@ -492,9 +498,11 @@ def _zscore_v3(cands, extra=()):
     _z("mom20", -1.0)        # 短期反转: 近20日涨幅低者加分
     _z("vol20", -1.0)        # 低波动加分
     _z("bias", -1.0)         # 距MA20越近越好(回调入场)
+    _z("vr", 1.0)            # 量比: 近5日均量/20日均量, 适度放量加分(2026-11-18采纳)
     for c in list(cands) + list(extra):
         c["score"] = (w["mom"] * c["z_m120"] + w["rev"] * c["z_mom20"]
-                      + w["vol"] * c["z_vol20"] + w["pull"] * c["z_bias"])
+                      + w["vol"] * c["z_vol20"] + w["pull"] * c["z_bias"]
+                      + w.get("vr", 0.0) * c["z_vr"])
 
 
 def _v3_extreme(code, bars, mom20, r5):
@@ -515,7 +523,8 @@ def _v3_reason(p, rank, n):
         why = "持仓/冷却中, 未参与本轮截面打分(仅候选观察)"
     else:
         names = {"z_m120": "中期动量强", "z_mom20": "短期回调充分",
-                 "z_vol20": "波动低", "z_bias": "贴近MA20回踩位"}
+                 "z_vol20": "波动低", "z_bias": "贴近MA20回踩位",
+                 "z_vr": "量比放大"}
         hl = sorted(((v, names[k]) for k, v in p.items() if k in names),
                     key=lambda kv: -kv[0])
         tops = "/".join(k for _, k in hl[:2])
@@ -533,11 +542,20 @@ def _select_v3(held, cool_dates, topk, deadline):
             "流动性不足": 0, "行情失败": 0, "门槛未达": 0, "冷却中": 0}
     res = {"v3": True, "boards": [], "board_n": 0, "cand_n": 0, "passing": [],
            "picks": [], "skip": skip, "lookback": config.PICK_V3_MOM_SPAN}
-    try:
-        boards = quotes.fetch_board_list("industry", n=95)
-    except Exception as e:
-        res["note"] = f"行业板块列表获取失败: {e}"
-        return res
+    boards = None
+    for _retry in range(3):                     # 板块列表间歇性失败/空返回, 重试3次
+        try:
+            bs = quotes.fetch_board_list("industry", n=95)
+            if bs:
+                boards = bs
+                break
+            err = "行业板块列表为空"
+        except Exception as e:
+            err = str(e)
+        if _retry == 2:
+            res["note"] = f"行业板块列表获取失败: {err}"
+            return res
+        time.sleep(2)
     res["board_n"] = len(boards)
     cands, seen = [], set()
     for b in boards:
@@ -583,6 +601,8 @@ def _select_v3(held, cool_dates, topk, deadline):
             continue
         p = {**c, **f, "mom": f["mom20"], "close": bars[-1]["close"], "bars": bars}
         p["extreme"] = _v3_extreme(p["code"], bars, p["mom"], f["r5"])
+        if config.PICK_V5_EN:                 # v5估算层价位快照(信息层, 不参与打分)
+            p.update(estim.snapshot(bars))
         passing.append(p)
     # 打分口径与回测一致: 先剔除持仓/冷却, 再对剩余候选做截面z-score
     # (2026-11-10好机会豁免: 冷却候选收集为extra, 套用elig同一截面参数补算分数,
