@@ -567,11 +567,62 @@ def _rebal_info(state, cal, rep_date):
             "max_hold": config.PICK_MAX_HOLD}
 
 
+def _money(x):
+    return f"{x / 10000:.2f}万" if abs(x) >= 10000 else f"{x:,.0f}元"
+
+
+def _tier_table_html(ep):
+    """阶梯止盈分档明细(嵌套表, 日报邮件与dashboard共用同一份plans行, 2026-11-21)"""
+    sh = ep["sh"]
+    heads = ["浮盈档", "回撤带宽", "升档条件(收盘)", "触发线", "卖出", "约回笼(费前)"]
+    h = ("<table style='border-collapse:collapse;margin:2px 0;'><tr>"
+         + "".join(f"<th style='border:1px solid #8a94a6;background:#3f4a5a;color:#fff;"
+                   f"padding:2px 6px;font-size:11px;white-space:nowrap;'>{t}</th>"
+                   for t in heads) + "</tr>")
+    for t in ep["tiers"]:
+        cells = [t["band"].replace("<", "&lt;") + ("·当前" if t["cur"] else ""),
+                 f"{t['bw'] * 100:.0f}%",
+                 (f"≥{t['enter']:.2f}" if t["enter"] else "默认档"),
+                 f"{'≈' if t['est'] else ''}{t['line']:.2f}",
+                 f"{sh}股(全清)", _money(sh * t["line"])]
+        if t["cur"]:
+            cells = [notify.colored(notify.bold(c), config.C_RED) for c in cells]
+        h += ("<tr>" + "".join(
+            f"<td style='border:1px solid #8a94a6;padding:2px 6px;font-size:11px;"
+            f"white-space:nowrap;'>{c}</td>" for c in cells) + "</tr>")
+    h += "</table>"
+    h += notify.colored("触发线随持仓最高收盘上移; 非当前档按升档进入价估算; "
+                        "升档带宽放宽=让利润奔跑; 任一价触发均为一次性全清", config.C_GRAY)
+    return h
+
+
+def _exit_plan_rows(nm, ep):
+    """一只持仓股 -> 多行: 每条出场线一行(触发价/卖出股数/预计回笼) + 阶梯止盈分档明细行
+    ep=adaptive.build_exit_plan, lines已按触发价降序(首行=最可能先触发)"""
+    sh, rows = ep["sh"], []
+    for i, l in enumerate(ep["lines"]):
+        pr = l.get("price")
+        rows.append([nm if i == 0 else "",
+                     notify.colored("⚪持有", config.C_GRAY) if i == 0 else "",
+                     l["kind"],
+                     notify.colored(notify.bold(f"{pr:.2f}"), config.C_GREEN) if pr else "-",
+                     f"{sh}股(全清)" if pr else "-",
+                     _money(sh * pr) if pr else "-",
+                     (f"收盘跌破→次日开盘离场; {l['note']}"
+                      + ("；各线同时在场先到先卖, 未破线则继续持有" if i == 0 else ""))])
+    if ep["tiers"]:
+        rows.append(["", "", notify.colored("阶梯止盈分档", config.C_GRAY), "-", "-", "-",
+                     _tier_table_html(ep)])
+    return rows
+
+
 def _build_plans(state, bars_map, cal, rep_date):
     """每只股票日后操作计划(日报"本次成交"节之后展示)
-    持仓: 有SELL挂单->明日开盘执行; 无挂单->趋势腿给MA10破位临界价, 超跌腿给出场规则
-    空仓: 冷却中的已清仓标的合并一行; 末尾附选股池现金与调仓倒计时
-    临界价算法: 明日收盘x < sum(closes[-9:])/9 ⟺ x < 明日MA10(跌破即触发次日卖出)"""
+    2026-11-21结构化改造(用户要求"加列+分档列出+触发条件更有格式"):
+      7列=标的/明日动作/出场线事项/触发价/触发卖出/预计回笼/触发条件与分档明细
+      持仓无挂单-> adaptive.build_exit_plan 每条出场线一行(吊灯/阶梯止盈/阶梯止损),
+      追加阶梯止盈三档分位明细嵌套表(每档触发线+卖出股数+约回笼); 超跌腿规则分行
+    空仓: 冷却中的已清仓标的合并一行; 末尾附选股池现金与调仓倒计时"""
     rows, cool_names = [], []
     last_sell = state.get("last_sell", {})
     for code in sorted(state["accounts"]):
@@ -585,57 +636,46 @@ def _build_plans(state, bars_map, cal, rep_date):
         if a["sh"] > 0:
             if p and p["act"] == "SELL":
                 rows.append([nm, notify.colored("🔴卖出", config.C_GREEN),
-                             f"明日开盘卖出全部{a['sh']}股（{p.get('reason', '')}）；"
-                             f"回款留存本子账户，调仓日归集入选股池"])
+                             "已挂卖出单", "明日开盘价", f"{a['sh']}股(全部)", "按开盘价成交",
+                             f"{p.get('reason', '')}；回款留存本子账户，调仓日归集入选股池"])
                 continue
             if p and p["act"] == "BUY_ADD":
                 rows.append([nm, notify.colored("🟢加仓", config.C_RED),
-                             f"明日开盘用待加仓额度约{a.get('add', 0):,.0f}元补足仓位"
-                             f"（首笔后收盘站上MA5确认）；跌破MA10仍按趋势腿离场"])
+                             "补足仓位", "明日开盘价", "按待加仓额度",
+                             f"约{a.get('add', 0):,.0f}元",
+                             "首笔后收盘站上MA5确认；跌破MA10仍按趋势腿离场"])
                 continue
             bars = bars_map.get(code)
+            ep = adaptive.build_exit_plan(a, bars)
+            if ep:
+                rows.extend(_exit_plan_rows(nm, ep))
+                continue
             if not a.get("sh_tr", True):
-                cond = (f"超跌腿规则：反弹至布林中轨止盈 / 收盘跌破信号低点"
-                        f"{a.get('sig_low', 0):.2f}止损 / 持仓满8日超时离场")
-            elif config.PICK_V3_EN and config.PICK_V3_EXIT == "chand":
-                cond = None
-                if bars and len(bars) >= 35:
-                    ind = build_ind(bars)
-                    j = len(bars) - 1
-                    atr = ind["atr"][j]
-                    if atr:
-                        n, k = config.PICK_V3_CHAND_N, config.PICK_V3_CHAND_K
-                        hh = max(b["close"] for b in bars[j - n + 1:])
-                        stop = hh - k * atr
-                        drop = (1 - stop / bars[j]["close"]) * 100
-                        cond = (f"收盘跌破吊灯线(≈{stop:.2f}＝{n}日最高收盘{hh:.2f}-"
-                                f"{k}×ATR，明日跌超{drop:.1f}%即触发)时，次日开盘离场；"
-                                f"阶梯止盈/止损同时在场，先到先卖")
-                if cond is None:
-                    cond = ("收盘跌破吊灯线(22日最高收盘-2×ATR)时次日开盘离场"
-                            "（行情缺失，未能计算临界价）")
-            elif bars and len(bars) >= 10:
-                closes = [b["close"] for b in bars]
-                crit = sum(closes[-9:]) / 9
-                drop = (1 - crit / closes[-1]) * 100
-                cond = (f"收盘跌破MA10(≈{crit:.2f}，明日跌超{drop:.1f}%即触发)时，"
-                        f"次日开盘离场；未跌破则一直持有（只跟趋势，不设止盈目标）")
-            else:
-                cond = "收盘跌破MA10时次日开盘离场（行情缺失，未能计算临界价）"
-            rows.append([nm, notify.colored("⚪持有", config.C_GRAY), cond])
+                cond = ("① 反弹至布林中轨止盈<br>"
+                        f"② 收盘跌破信号低点{a.get('sig_low', 0):.2f}止损<br>"
+                        "③ 持仓满8日超时离场")
+                rows.append([nm, notify.colored("⚪持有", config.C_GRAY),
+                             "超跌腿出场", "-", f"{a['sh']}股(全清)", "-", cond])
+                continue
+            miss = ("吊灯线(22日最高收盘-2×ATR)"
+                    if config.PICK_V3_EN and config.PICK_V3_EXIT == "chand" else "MA10")
+            rows.append([nm, notify.colored("⚪持有", config.C_GRAY), "趋势破位离场",
+                         "-", f"{a['sh']}股(全清)", "-",
+                         f"收盘跌破{miss}时次日开盘离场（行情缺失，未能计算临界价）"])
         elif p and p["act"].startswith("BUY"):
             if p["act"] == "BUY_SCALP" and p.get("need") and not p.get("o_checked"):
                 txt = f"明日开盘≥{p['need']:.2f}确认才买入，否则信号取消"
             else:
                 txt = "明日开盘按子账户资金买入"
-            rows.append([nm, notify.colored("🟢买入", config.C_RED),
-                         f"{txt}（{p.get('reason', '')}；可用资金{a['cash']:,.0f}元）"])
+            rows.append([nm, notify.colored("🟢买入", config.C_RED), "开仓",
+                         "明日开盘价", "-", f"可用{a['cash']:,.0f}元",
+                         f"{txt}（{p.get('reason', '')}）"])
         elif a.get("pool") and a["cash"] > 0:
             # 共振模式候选: 已分配资金等v2.2信号择机入场
-            rows.append([nm, notify.colored("⏳候选", config.C_GRAY),
-                         f"已分配资金{a['cash']:,.2f}元，等待v2.2信号"
-                         f"（趋势站上/超跌/冰点左侧）择机入场；"
-                         f"下个调仓日仍无信号则资金回收重选"])
+            rows.append([nm, notify.colored("⏳候选", config.C_GRAY), "等待入场信号",
+                         "-", "-", f"已分配{a['cash']:,.2f}元",
+                         "等待v2.2信号（趋势站上/超跌/冰点左侧）择机入场；"
+                         "下个调仓日仍无信号则资金回收重选"])
         elif code in last_sell:
             sd = last_sell[code]
             left = (config.PICK_COOLDOWN - (cal.index(rep_date) - cal.index(sd))
@@ -643,11 +683,10 @@ def _build_plans(state, bars_map, cal, rep_date):
             cool_names.append(a["name"] + (f"(剩{left}日)" if left and left > 0 else ""))
     if cool_names:
         rows.append([notify.colored("已清仓标的", config.C_GRAY),
-                     notify.colored("⏸冷却", config.C_GRAY),
+                     notify.colored("⏸冷却", config.C_GRAY), "禁止买回", "-", "-", "-",
                      "、".join(cool_names) +
                      f"；卖出后{config.PICK_COOLDOWN}个交易日内禁止买回"
-                     f"(特别好机会可豁免), "
-                     f"回款已在调仓日归集或待归集"])
+                     f"(特别好机会可豁免), 回款已在调仓日归集或待归集"])
     lr = state.get("last_rebal")
     n_hold = sum(1 for a in state["accounts"].values()
                  if a["sh"] > 0 or a.get("pending") or a["cash"] > 0)
@@ -670,11 +709,10 @@ def _build_plans(state, bars_map, cal, rep_date):
         hot_txt += (("；" if hot_txt else "")
                     + "大盘门控: 上证收盘<MA20时暂停新开仓")
     rows.append([notify.colored("选股池", config.C_GRAY),
-                 notify.colored("💰资金", config.C_GRAY),
-                 f"现金{state.get('pool_cash', 0.0):,.2f}元；{rb_txt}"
-                 f"（常规每{config.PICK_REBAL}个交易日一次, 持股目标"
-                 f"{config.PICK_MIN_HOLD}~{config.PICK_MAX_HOLD}只, 达上限封顶；"
-                 f"{hot_txt}）"])
+                 notify.colored("💰资金", config.C_GRAY), "调仓与建仓", "-", "-",
+                 f"现金{state.get('pool_cash', 0.0):,.2f}元",
+                 f"{rb_txt}（常规每{config.PICK_REBAL}个交易日一次, 持股目标"
+                 f"{config.PICK_MIN_HOLD}~{config.PICK_MAX_HOLD}只, 达上限封顶；{hot_txt}）"])
     return rows
 
 
@@ -1291,8 +1329,7 @@ def build_report(state, fills, last_closes, rep_date, sel=None, stale=None, plan
               str(r["qty"]), f"{r['price']:.3f}", f"{r['amount']:,.2f}",
               f"{r['fee']:.2f}", r["reason"]] for r in fills])
     if plans:
-        body += notify.sec("日后操作计划") + notify.table(
-            ["标的", "明日动作", "计划与触发条件"], plans)
+        body += notify.sec("日后操作计划") + notify.table(dashboard.PLAN_HEADERS, plans)
     body += _sel_section(sel, state)
     if obs is not None:
         body += _pool_section(obs, state, cal, rep_date, menv=menv)

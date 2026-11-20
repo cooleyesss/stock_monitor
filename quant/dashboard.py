@@ -17,6 +17,9 @@ from core.indicators import build_ind
 from quant import account
 
 KLT_DAILY, BARS_LMT = 101, 120
+# 日后操作计划表头(2026-11-21结构化7列; engine日报渲染与前端plans_head共用同一定义)
+PLAN_HEADERS = ["标的", "明日动作", "出场线/事项", "触发价", "触发卖出",
+                "预计回笼", "触发条件与分档明细"]
 DASH_PATH = os.path.join(config.REPORT_DIR, "quant", "dashboard_quant.html")
 os.makedirs(os.path.dirname(DASH_PATH), exist_ok=True)   # report/quant/ 子目录(2026-10-28用户要求与T侧日报分离)
 
@@ -330,6 +333,7 @@ def build(state, bars_map=None, fills=None, rep_date=None, sel=None, now=None,
             "fills": day_fills,
             "chg_pos": chg_p,
             "plans": plans or [],
+            "plans_head": PLAN_HEADERS,
             "rebal": rebal_info,
             "sel": ({"rep_date": sel.get("rep_date"),
                      "boards": [{"kind_cn": b["kind_cn"], "name": b["name"],
@@ -412,6 +416,11 @@ box-shadow:0 8px 20px rgba(0,0,0,.5);white-space:nowrap}
 .tip .tt{color:#fff;font-weight:700;margin-bottom:3px}
 .tip .mut{color:var(--mut)}
 .note{font-size:12px;color:var(--mut);line-height:1.8;margin:-8px 0 10px}
+.plantbl td{vertical-align:top}
+.plantbl tr.grp td{border-top:2px solid #46536b}
+.plantbl td table{width:auto;background:transparent}
+.plantbl td table td{border-top:none}
+.plantbl td table tr:hover td{background:transparent}
 .chart .t{font-size:13px;color:var(--mut);margin-bottom:6px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
 canvas{width:100%;display:block}
 .warn{background:rgba(240,160,32,.1);border:1px solid rgba(240,160,32,.4);
@@ -443,6 +452,8 @@ border-radius:8px;padding:10px 12px;color:#f0c89a;font-size:13px;margin:10px 0}
 <div id="chgpos"></div>
 
 <h2>日后操作计划（每只持仓的后继策略）</h2>
+<div class="note">持仓按<b>出场线</b>逐条列出（触发价最高者最可能先触发）：吊灯止损 / 阶梯止盈 / 阶梯止损
+<b>同时在场、先到先卖，任一触发即全清该股</b>；下方「阶梯止盈分档」给出三档各自的触发线、卖出股数与约回笼金额。</div>
 <div id="plans"></div>
 
 <h2>实盘 · 持仓标的 日K与买卖操作点</h2>
@@ -623,8 +634,11 @@ window.__drawQEq(null);
 // ---------- 日后操作计划(持仓后继策略) ----------
 (function(){const P=Q.plans||[];const el=document.getElementById('plans');
  if(!P.length){el.innerHTML='<div class="mut">暂无计划</div>';return;}
- let h='<table><tr><th>标的</th><th>明日动作</th><th>计划与触发条件</th></tr>';
- for(const r of P)h+=`<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td></tr>`;
+ const H=Q.plans_head||['标的','明日动作','计划与触发条件'];
+ let h='<table class="plantbl"><tr>'+H.map(x=>`<th>${x}</th>`).join('')+'</tr>';
+ for(const r of P){
+  h+=`<tr class="${r[0]?'grp':''}">`
+   +H.map((_,i)=>`<td>${r[i]===undefined||r[i]===null?'':r[i]}</td>`).join('')+'</tr>';}
  h+='</table>';
  el.innerHTML=h;})();
 

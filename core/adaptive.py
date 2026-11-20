@@ -114,6 +114,80 @@ def evaluate(code, bars, holding=0, mkt_cl=None):
     return {"action": "WATCH", "reason": "无信号", "level": "", "snap": snap}
 
 
+def build_exit_plan(a, bars):
+    """持仓出场线 + 阶梯止盈分档(2026-11-21 日报"日后操作计划"结构化改造, 引擎/dashboard共用)
+    与 decide() 同口径:
+      阶梯止盈: 按当前收盘浮盈pf取带宽档(升档即放宽), 触发线=hmax×(1-带宽), 先吸收最新收盘入hmax
+      阶梯止损: 按最高浮盈pfh=hmax/entry-1取档(只上不下), 线=entry×档系数
+      趋势破位: v3吊灯=N日最高收盘-k×ATR14; 否则MA10临界价
+    返回 {"sh","entry","close","hmax","pf","pfh","lines","tiers"}
+      lines: 当前生效出场线, 按触发价降序(最高=最可能先触发) {"kind","price","note"}
+      tiers: 阶梯止盈分档预览(升序) {"band","bw","enter","line","est","cur"}
+             当前档line用真实hmax; 其余档按"升档进入价enter"估算(est=True), 实际随hmax上移
+    超跌腿/无入场价/无价格 -> None(调用方走原文案)"""
+    if not a.get("sh_tr", True) or a.get("sh", 0) <= 0:
+        return None
+    ent = a.get("entry_px") or a.get("cost") or 0.0
+    hmax = a.get("hmax") or 0.0
+    if ent <= 0:
+        return None
+    if bars:
+        close = bars[-1]["close"]
+        hmax = max(hmax, close)                  # 与decide一致: 先吸收最新收盘
+    else:
+        close = a.get("px") or 0.0
+    if close <= 0 or hmax <= 0:
+        return None
+    pf, pfh = close / ent - 1, hmax / ent - 1
+    lines = []
+    if config.PICK_V3_EN and config.PICK_V3_EXIT == "chand":
+        if bars and len(bars) >= 35:
+            ind = build_ind(bars)
+            j = len(bars) - 1
+            atr = ind["atr"][j]
+            if atr and j >= config.PICK_V3_CHAND_N - 1:
+                n, k = config.PICK_V3_CHAND_N, config.PICK_V3_CHAND_K
+                hh = max(b["close"] for b in bars[j - n + 1:])
+                lines.append({"kind": "吊灯止损", "price": hh - k * atr,
+                              "note": f"{n}日最高收盘{hh:.2f} − {k}×ATR{atr:.3f}"})
+        if not lines:
+            lines.append({"kind": "吊灯止损", "price": None,
+                          "note": "行情缺失, 未能计算临界价"})
+    elif bars and len(bars) >= 10:
+        crit = sum(b["close"] for b in bars[-9:]) / 9
+        lines.append({"kind": "MA10破位", "price": crit, "note": "明日MA10临界价"})
+    cur_th = None
+    if config.DYN_TRAIL_EN:
+        for th, t in config.DYN_TRAIL_TIERS:
+            if pf >= th:
+                cur_th = th
+                lines.append({"kind": f"阶梯止盈{t * 100:.0f}%档", "price": hmax * (1 - t),
+                              "note": f"当前浮盈{pf * 100:+.1f}% → 最高收盘{hmax:.2f}×{1 - t:.2f}"})
+                break
+        if config.DYN_STOP_EN:
+            for th, ln in config.DYN_STOP_TIERS:
+                if pfh >= th:
+                    lines.append({"kind": "阶梯止损", "price": ent * ln,
+                                  "note": f"最高浮盈{pfh * 100:+.1f}% → 保底{(ln - 1) * 100:+.0f}%"})
+                    break
+    tiers = []
+    if config.DYN_TRAIL_EN:
+        asc = sorted(config.DYN_TRAIL_TIERS, key=lambda x: x[0])   # 升序: <15% / 15~30% / ≥30%
+        for i, (th, t) in enumerate(asc):
+            nxt = asc[i + 1][0] if i + 1 < len(asc) else None
+            band = (f"≥{th * 100:.0f}%" if nxt is None
+                    else (f"<{nxt * 100:.0f}%" if th == 0
+                          else f"{th * 100:.0f}~{nxt * 100:.0f}%"))
+            enter = ent * (1 + th)
+            cur = (cur_th == th)
+            base = hmax if cur else enter         # 非当前档: 按升档进入价估算
+            tiers.append({"band": band, "bw": t, "enter": enter if th > 0 else None,
+                          "line": base * (1 - t), "est": not cur, "cur": cur})
+    lines.sort(key=lambda l: -(l["price"] or 0))  # 触发价最高者最可能先触发
+    return {"sh": a["sh"], "entry": ent, "close": close, "hmax": hmax,
+            "pf": pf, "pfh": pfh, "lines": lines, "tiers": tiers}
+
+
 def scan(state, tplan=None):
     """扫描持仓股(ETF映射真实代码, 持股>0为持有)+做T计划股 -> 信号行list"""
     watch = {}
