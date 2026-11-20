@@ -586,18 +586,23 @@ def _kind_badge(kind):
 
 
 def _tier_table_html(ep):
-    """阶梯止盈分档明细(嵌套表, 日报邮件与dashboard共用同一份plans行, 2026-11-21)"""
-    sh = ep["sh"]
-    heads = ["浮盈档", "回撤带宽", "升档条件(收盘)", "触发线", "卖出", "约回笼(费前)"]
+    """阶梯止盈分档明细(嵌套表, 日报邮件与dashboard共用同一份plans行, 2026-11-21)
+    含距现价列: 触发线相对最新收盘还差多少(非当前档按升档进入价估算, 标≈)"""
+    sh, close = ep["sh"], ep.get("close") or 0
+    heads = ["浮盈档", "回撤带宽", "升档条件(收盘)", "触发线", "距现价", "卖出",
+             "约回笼(费前)"]
     h = ("<table style='border-collapse:collapse;margin:2px 0;'><tr>"
          + "".join(f"<th style='border:1px solid #8a94a6;background:#3f4a5a;color:#fff;"
                    f"padding:2px 6px;font-size:11px;white-space:nowrap;'>{t}</th>"
                    for t in heads) + "</tr>")
     for t in ep["tiers"]:
+        dp = (f"{'≈' if t['est'] else ''}{(t['line'] / close - 1) * 100:+.1f}%"
+              if close > 0 else "-")
         cells = ["💰 " + t["band"].replace("<", "&lt;") + ("·当前" if t["cur"] else ""),
                  f"{t['bw'] * 100:.0f}%",
                  (f"≥{t['enter']:.2f}" if t["enter"] else "默认档"),
                  f"{'≈' if t['est'] else ''}{t['line']:.2f}",
+                 dp,
                  f"{sh}股(全清)", _money(sh * t["line"])]
         if t["cur"]:
             cells = [notify.colored(notify.bold(c), config.C_RED) for c in cells]
@@ -615,17 +620,26 @@ def _tier_table_html(ep):
 def _exit_plan_rows(nm, ep):
     """一只持仓股 -> 多行: 每条出场线一行(触发价/卖出股数/预计回笼) + 阶梯止盈分档明细行
     ep=adaptive.build_exit_plan, lines已按触发价降序(首行=最可能先触发)
-    2026-11-21格式改造: 出场线带💰止盈(红)/🛑止损(绿)徽章; 触发条件逐行排列"""
-    sh, rows = ep["sh"], []
+    2026-11-21格式改造: 出场线带💰止盈(红)/🛑止损(绿)徽章; 触发条件逐行排列,
+    首行写明跌破价位+较现价还需跌多少"""
+    sh, close, rows = ep["sh"], ep.get("close") or 0, []
     for i, l in enumerate(ep["lines"]):
         pr = l.get("price")
+        if pr and close > 0:
+            first = (f"收盘跌破 {pr:.2f}"
+                     f"（较现价{close:.2f}再跌{(1 - pr / close) * 100:.1f}%）"
+                     f" → 次日开盘离场")
+        elif pr:
+            first = f"收盘跌破 {pr:.2f} → 次日开盘离场"
+        else:
+            first = "收盘跌破该线 → 次日开盘离场"
         rows.append([nm if i == 0 else "",
                      notify.colored("⚪持有", config.C_GRAY) if i == 0 else "",
                      _kind_badge(l["kind"]),
                      notify.colored(notify.bold(f"{pr:.2f}"), config.C_GREEN) if pr else "-",
                      f"{sh}股(全清)" if pr else "-",
                      _money(sh * pr) if pr else "-",
-                     _br(f"收盘跌破 → 次日开盘离场",
+                     _br(first,
                          f"· {l['note']}",
                          "· 三线同时在场, 先到先卖" if i == 0 else "",
                          "· 未破线继续持有" if i == 0 else "")])
