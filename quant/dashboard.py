@@ -332,7 +332,8 @@ def build(state, bars_map=None, fills=None, rep_date=None, sel=None, now=None,
             "stocks": stocks,
             "fills": day_fills,
             "chg_pos": chg_p,
-            "plans": plans or [],
+            "plans": (plans or {}).get("rows") or [],
+            "plans_cards": (plans or {}).get("cards") or [],
             "plans_head": PLAN_HEADERS,
             "rebal": rebal_info,
             "sel": ({"rep_date": sel.get("rep_date"),
@@ -421,6 +422,10 @@ box-shadow:0 8px 20px rgba(0,0,0,.5);white-space:nowrap}
 .plantbl td table{width:auto;background:transparent}
 .plantbl td table td{border-top:none}
 .plantbl td table tr:hover td{background:transparent}
+.plancard{background:var(--card)}
+.plancard table{margin:4px 0}
+.plancard table td,.plancard table th{background:transparent}
+.plancard tr:hover td{background:transparent}
 .chart .t{font-size:13px;color:var(--mut);margin-bottom:6px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
 canvas{width:100%;display:block}
 .warn{background:rgba(240,160,32,.1);border:1px solid rgba(240,160,32,.4);
@@ -632,14 +637,14 @@ window.__drawQEq(null);
 })();
 
 // ---------- 日后操作计划(持仓后继策略) ----------
-(function(){const P=Q.plans||[];const el=document.getElementById('plans');
- if(!P.length){el.innerHTML='<div class="mut">暂无计划</div>';return;}
- const H=Q.plans_head||['标的','明日动作','计划与触发条件'];
- let h='<table class="plantbl"><tr>'+H.map(x=>`<th>${x}</th>`).join('')+'</tr>';
- for(const r of P){
-  h+=`<tr class="${r[0]?'grp':''}">`
+(function(){const C=Q.plans_cards||[];const P=Q.plans||[];const el=document.getElementById('plans');
+ if(!C.length&&!P.length){el.innerHTML='<div class="mut">暂无计划</div>';return;}
+ let h=C.map(c=>`<div class="plancard">${c}</div>`).join('');
+ if(P.length){const H=Q.plans_head||['标的','明日动作','计划与触发条件'];
+  h+='<table class="plantbl"><tr>'+H.map(x=>`<th>${x}</th>`).join('')+'</tr>';
+  for(const r of P){h+=`<tr class="${r[0]?'grp':''}">`
    +H.map((_,i)=>`<td>${r[i]===undefined||r[i]===null?'':r[i]}</td>`).join('')+'</tr>';}
- h+='</table>';
+  h+='</table>';}
  el.innerHTML=h;})();
 
 // ---------- 回测分层资金曲线 ----------

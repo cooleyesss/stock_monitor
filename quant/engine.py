@@ -617,46 +617,53 @@ def _tier_table_html(ep):
     return h
 
 
-def _exit_plan_rows(nm, ep):
-    """一只持仓股 -> 多行: 每条出场线一行(触发价/卖出股数/预计回笼) + 阶梯止盈分档明细行
-    ep=adaptive.build_exit_plan, lines已按触发价降序(首行=最可能先触发)
-    2026-11-21格式改造: 出场线带💰止盈(红)/🛑止损(绿)徽章; 触发条件逐行排列,
-    首行写明跌破价位+较现价还需跌多少"""
-    sh, close, rows = ep["sh"], ep.get("close") or 0, []
-    for i, l in enumerate(ep["lines"]):
+def _exit_card_html(nm, ep):
+    """持仓股出场计划卡(2026-11-21排版重构: 弃用7列大表多行, 一股一卡)
+    卡=标题行(持股/成本/现价/浮盈) + 出场线小表(含距现价) + 公式脚注 + 阶梯止盈分档表;
+    全内联样式, 日报邮件与dashboard渲染完全一致"""
+    sh, close = ep["sh"], ep["close"]
+    accent = config.C_RED if ep["pf"] >= 0 else config.C_GREEN
+    head = (notify.bold(nm)
+            + notify.colored(f" ⚪持有 {sh:,}股 · 成本{ep['entry']:.2f}"
+                             f" · 现价{close:.2f} · 浮盈{ep['pf'] * 100:+.1f}%",
+                             config.C_GRAY))
+    heads = ["出场线", "触发价", "距现价", "触发卖出", "约回笼"]
+    h = (f"<div style='border:1px solid #8a94a6;border-left:4px solid {accent};"
+         f"border-radius:6px;padding:8px 10px;margin:8px 0;font-size:12px;'>"
+         f"<div style='margin-bottom:6px;'>{head}</div>"
+         f"<table style='border-collapse:collapse;'><tr>"
+         + "".join(f"<th style='border:1px solid #8a94a6;background:#3f4a5a;color:#fff;"
+                   f"padding:3px 8px;font-size:11px;white-space:nowrap;'>{t}</th>"
+                   for t in heads) + "</tr>")
+    for l in ep["lines"]:
         pr = l.get("price")
-        if pr and close > 0:
-            first = (f"收盘跌破 {pr:.2f}"
-                     f"（较现价{close:.2f}再跌{(1 - pr / close) * 100:.1f}%）"
-                     f" → 次日开盘离场")
-        elif pr:
-            first = f"收盘跌破 {pr:.2f} → 次日开盘离场"
-        else:
-            first = "收盘跌破该线 → 次日开盘离场"
-        rows.append([nm if i == 0 else "",
-                     notify.colored("⚪持有", config.C_GRAY) if i == 0 else "",
-                     _kind_badge(l["kind"]),
-                     notify.colored(notify.bold(f"{pr:.2f}"), config.C_GREEN) if pr else "-",
-                     f"{sh}股(全清)" if pr else "-",
-                     _money(sh * pr) if pr else "-",
-                     _br(first,
-                         f"· {l['note']}",
-                         "· 三线同时在场, 先到先卖" if i == 0 else "",
-                         "· 未破线继续持有" if i == 0 else "")])
+        dp = f"{(pr / close - 1) * 100:+.1f}%" if pr and close > 0 else "-"
+        h += ("<tr>" + "".join(
+            f"<td style='border:1px solid #8a94a6;padding:3px 8px;font-size:11px;"
+            f"white-space:nowrap;'>{c}</td>" for c in [
+                _kind_badge(l["kind"]),
+                notify.colored(notify.bold(f"{pr:.2f}"), config.C_GREEN) if pr else "-",
+                dp,
+                f"{sh:,}股(全清)" if pr else "-",
+                _money(sh * pr) if pr else "-"]) + "</tr>")
+    h += "</table>"
+    h += notify.colored(_br(
+        "⚠ 收盘跌破任一触发价 → 次日开盘全清（三线同时在场, 先到先卖）",
+        "· 未破线继续持有, 触发线随最高收盘上移",
+        *[f"· {l['kind']}: {l['note']}" for l in ep["lines"]]), config.C_GRAY)
     if ep["tiers"]:
-        rows.append(["", "", notify.colored("阶梯止盈分档", config.C_GRAY), "-", "-", "-",
-                     _tier_table_html(ep)])
-    return rows
+        h += "<div style='margin:4px 0;'>" + _tier_table_html(ep) + "</div>"
+    h += "</div>"
+    return h
 
 
 def _build_plans(state, bars_map, cal, rep_date):
     """每只股票日后操作计划(日报"本次成交"节之后展示)
-    2026-11-21结构化改造(用户要求"加列+分档列出+触发条件更有格式"):
-      7列=标的/明日动作/出场线事项/触发价/触发卖出/预计回笼/触发条件与分档明细
-      持仓无挂单-> adaptive.build_exit_plan 每条出场线一行(吊灯/阶梯止盈/阶梯止损),
-      追加阶梯止盈三档分位明细嵌套表(每档触发线+卖出股数+约回笼); 超跌腿规则分行
+    2026-11-21排版重构(用户反馈7列大表排版乱): 返回{"cards","rows"}
+      cards: 持仓股各一张出场计划卡(_exit_card_html, 卡内出场线小表+公式脚注+分档表)
+      rows : 简单行(挂单/超跌腿/行情缺失/买入/候选/冷却/选股池资金), 仍走7列表格
     空仓: 冷却中的已清仓标的合并一行; 末尾附选股池现金与调仓倒计时"""
-    rows, cool_names = [], []
+    rows, cards, cool_names = [], [], []
     last_sell = state.get("last_sell", {})
     for code in sorted(state["accounts"]):
         a = state["accounts"][code]
@@ -684,7 +691,7 @@ def _build_plans(state, bars_map, cal, rep_date):
             bars = bars_map.get(code)
             ep = adaptive.build_exit_plan(a, bars)
             if ep:
-                rows.extend(_exit_plan_rows(nm, ep))
+                cards.append(_exit_card_html(nm, ep))
                 continue
             if not a.get("sh_tr", True):
                 cond = _br("💰 反弹至布林中轨 → 止盈全清",
@@ -749,7 +756,7 @@ def _build_plans(state, bars_map, cal, rep_date):
                  notify.colored("💰资金", config.C_GRAY), "调仓与建仓", "-", "-",
                  f"现金{state.get('pool_cash', 0.0):,.2f}元",
                  _br(*pool_notes)])
-    return rows
+    return {"cards": cards, "rows": rows}
 
 
 def _sel_section_v3(sel, state):
@@ -1364,8 +1371,12 @@ def build_report(state, fills, last_closes, rep_date, sel=None, stale=None, plan
                              config.C_RED if r["side"] == "BUY" else config.C_GREEN),
               str(r["qty"]), f"{r['price']:.3f}", f"{r['amount']:,.2f}",
               f"{r['fee']:.2f}", r["reason"]] for r in fills])
-    if plans:
-        body += notify.sec("日后操作计划") + notify.table(dashboard.PLAN_HEADERS, plans)
+    if plans and (plans.get("cards") or plans.get("rows")):
+        body += notify.sec("日后操作计划")
+        for c in plans["cards"]:                    # 持仓出场计划卡(一股一卡)
+            body += c
+        if plans["rows"]:                           # 简单行(挂单/买入/候选/冷却/资金)
+            body += notify.table(dashboard.PLAN_HEADERS, plans["rows"])
     body += _sel_section(sel, state)
     if obs is not None:
         body += _pool_section(obs, state, cal, rep_date, menv=menv)
