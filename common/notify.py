@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """微信推送(PushPlus) + HTML着色小工具"""
+import time
+
 import requests
 import config_common as config
 
@@ -8,22 +10,36 @@ DRY = False   # 干跑模式由 main.py 置True: 只打印不真实推送
 
 _PPC_MAX = 19000          # pushplus服务端上限2万字, 留余量
 _SEC_MARK = "<div style='font-weight:bold"   # sec()小节标题起始标记(分段切点)
+_SEG_GAP = 6              # 多段推送间隔秒数(防触发服务端限频, 2026-11-23)
 
 
-def _send_one(title, content):
-    try:
-        r = requests.post("http://www.pushplus.plus/send", json={
-            "token": config.PUSHPLUS_TOKEN, "title": title,
-            "content": content, "template": "html",
-        }, timeout=10)
-        ok = r.json().get("code") == 200
-        print(("已推送: " if ok else "推送失败: ") + title)
-        if not ok:
-            print("  pushplus返回:", r.text[:300])
-        return ok
-    except Exception as e:
-        print("推送异常:", e)
-        return False
+
+def _send_one(title, content, retries=2):
+    """单条推送; 2026-11-23 pushplus限频(推送频率过快)时等待重试而非丢弃"""
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post("http://www.pushplus.plus/send", json={
+                "token": config.PUSHPLUS_TOKEN, "title": title,
+                "content": content, "template": "html",
+            }, timeout=10)
+            if r.json().get("code") == 200:
+                print("已推送: " + title)
+                return True
+            txt = r.text[:300]
+            if ("频率" in txt or "频繁" in txt) and attempt < retries:
+                print(f"  pushplus限频, 30秒后重试({attempt + 1}/{retries}): {title}")
+                time.sleep(30)
+                continue
+            print("推送失败: " + title)
+            print("  pushplus返回:", txt)
+            return False
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(10)
+                continue
+            print("推送异常:", e)
+            return False
+    return False
 
 
 def _split_content(content, limit=_PPC_MAX):
@@ -53,9 +69,11 @@ def send(title, content):
     if len(content) <= _PPC_MAX:
         return _send_one(title, content)
     parts = _split_content(content)
-    print(f"[推送] 正文{len(content)}字超限, 分{len(parts)}段推送")
+    print(f"[推送] 正文{len(content)}字超限, 分{len(parts)}段推送(间隔{_SEG_GAP}秒)")
     ok = True
     for i, seg in enumerate(parts, 1):
+        if i > 1:
+            time.sleep(_SEG_GAP)               # 段间隔: 防限频
         ok = _send_one(f"{title}({i}/{len(parts)})", seg) and ok
     return ok
 

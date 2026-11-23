@@ -1549,7 +1549,7 @@ def run(dry=False, push=True, now=None, dash=True):
               f"{state.get('pool_cash', 0.0):,.2f})")
         if dash_path:
             print(f"  dashboard -> {dash_path}")
-        return True
+        return body            # 2026-11-23: dry分支返回报告正文(供重出/追加消息面复用)
     notify.send(title, body)
     if dash_path:
         account.append_log(f"{rep_date} dashboard -> {dash_path}", dry=dry)
