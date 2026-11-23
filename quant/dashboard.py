@@ -214,6 +214,8 @@ def _holdings_change(before, state, fills, rep_date, stocks, bars_map):
                       "reason": r.get("reason", "")} for r in acts],
             "after_sh": ash,
             "close": close,
+            "pct": (round((close / prev_close - 1) * 100, 2)
+                    if close is not None and prev_close else None),   # 当日涨跌幅
             "mv": round(ash * close, 2) if close is not None else None,
             "cash": round(acash, 2),
             "sig": _sig_text(a) if a else "",
@@ -315,6 +317,8 @@ def build(state, bars_map=None, fills=None, rep_date=None, sel=None, now=None,
     has_new_pos = bool(chg_p) and any(r.get("new") for r in chg_p["rows"])
     # ── 回测: 仅当有新开仓时才加载(省时间 + 用户明确要求) ──
     bt_payload = _backtest_payload() if has_new_pos else None
+    # 池内入池天数口径与邮件一致(交易日): 用权益记录日期序列近似交易日历
+    _eq_days = [x.get("date") for x in (state.get("equity") or [])]
     payload = {
         "quant": {
             "rep_date": rep_date, "init_date": state.get("init_date"),
@@ -356,6 +360,12 @@ def build(state, bars_map=None, fills=None, rep_date=None, sel=None, now=None,
                                 or f"{e['board_kind_cn']}·{e['board_name']}",
                                 "mom": e["mom"], "close": e["close"],
                                 "hits": e["hits"],
+                                "chg_in": (round((e["close"] / e["first_close"] - 1)
+                                                 * 100, 1)
+                                           if e.get("first_close") else None),  # 进池后涨幅
+                                "in_days": (len(_eq_days) - _eq_days.index(e["first_date"])
+                                            if e.get("first_date") in _eq_days
+                                            and rep_date in _eq_days else None),
                                 "extreme": e.get("extreme", False),
                                 "held": state["accounts"].get(e["code"], {})
                                         .get("sh", 0) > 0}
@@ -616,7 +626,7 @@ window.__drawQEq(null);
   bar+=`<span>总资产 昨收 <b>${num(C.before_total)}</b> → 收盘 <b>${num(Q.total)}</b>
    <b class="${clr(d)}">${d>=0?'+':''}${num(d)}</b></span>`;}
  bar+='</div>';
- let h='<tr><th>标的</th><th>昨收持股</th><th>今日开盘成交</th><th>收盘持股</th><th>今收价</th><th>收盘市值</th><th title="每股为独立子账户: 卖出回款(或拨款的买入零头)暂存于此, 不参与其他标的买入; 调仓日归集到选股池">子账户现金</th><th>明日信号</th></tr>';
+ let h='<tr><th>标的</th><th>昨收持股</th><th>今日开盘成交</th><th>收盘持股</th><th>今收价</th><th>涨跌幅</th><th>收盘市值</th><th title="每股为独立子账户: 卖出回款(或拨款的买入零头)暂存于此, 不参与其他标的买入; 调仓日归集到选股池">子账户现金</th><th>明日信号</th></tr>';
  for(const r of C.rows){
   const act=r.acts.map(a=>`<span class="tag ${a.side==='BUY'?'b':'s'}">${a.side==='BUY'?'买入':'卖出'} ${a.qty}@${a.price.toFixed(3)} ${a.reason}</span>`).join(' ')||'<span class="mut">—</span>';
   const shCls=r.before_sh>0&&r.after_sh===0?'neg':(r.before_sh===0&&r.after_sh>0?'pos':'');
@@ -625,6 +635,7 @@ window.__drawQEq(null);
    <td>${act}</td>
    <td class="${shCls}"><b>${r.after_sh||0}</b></td>
    <td>${r.close==null?'-':r.close.toFixed(3)}</td>
+   <td>${r.pct==null?'<span class="mut">-</span>':`<span class="${clr(r.pct)}"><b>${r.pct>=0?'+':''}${r.pct.toFixed(2)}%</b></span>`}</td>
    <td>${r.mv==null?'-':num(r.mv)}</td>
    <td>${r.cash?num(r.cash):'<span class="mut">0</span>'}</td>
    <td>${r.sig||'<span class="mut">—</span>'}</td></tr>`;}
@@ -892,11 +903,15 @@ window.__qs_state={};
   b+=`<div style="margin-bottom:8px">当前池内择优: <b class="pos">`
    +PL.best.map(x=>`${x.name}(${pct(x.mom*100)})`).join('、')+'</b></div>';
  if(PL.rows&&PL.rows.length){
-  b+='<table><tr><th>候选(按动量)</th><th>所属板块</th><th>20日动量</th><th>现价</th><th>上榜</th><th>标记</th></tr>';
-  for(const e of PL.rows)
+  b+='<table><tr><th>候选(按动量)</th><th>所属板块</th><th>20日动量</th><th>现价</th><th title="入池首日收盘 -> 最近刷新日收盘">进池后涨幅</th><th>上榜</th><th>标记</th></tr>';
+  for(const e of PL.rows){
+   const ci=(e.chg_in==null)?'<span class="mut">-</span>'
+    :`<span class="${e.chg_in>=0?'pos':'neg'}"><b>${e.chg_in>=0?'+':''}${e.chg_in.toFixed(1)}%</b></span>`
+     +(e.in_days!=null?`<span class="mut"> ${e.in_days}日</span>`:'');
    b+=`<tr><td>${e.name}(${e.code})${e.held?' <span class="mut">[已持仓]</span>':''}</td>
     <td>${e.board}</td><td class="pos">${pct(e.mom*100)}</td><td>${e.close.toFixed(3)}</td>
-    <td>${e.hits}</td><td>${e.extreme?'<span style="color:var(--amber)">⚠连板极端</span>':'<span class="mut">-</span>'}</td></tr>`;
+    <td>${ci}</td>
+    <td>${e.hits}</td><td>${e.extreme?'<span style="color:var(--amber)">⚠连板极端</span>':'<span class="mut">-</span>'}</td></tr>`;}
   b+='</table>';}
  el.innerHTML=b;})();
 
