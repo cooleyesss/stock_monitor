@@ -223,6 +223,8 @@ def limitup_market_on():
     接口失败/有效日不足 -> False(保守: 极端沉底)"""
     days = []
     d = datetime.date.today()
+    if not quotes.market_opened():           # 未开盘: 今日涨停池尚无数据, 从上一交易日起
+        d -= datetime.timedelta(days=1)
     while len(days) < config.PICK_ZTM_DAYS:
         if d.weekday() < 5:
             days.append(d)

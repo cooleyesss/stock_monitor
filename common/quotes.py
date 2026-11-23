@@ -831,6 +831,15 @@ def _clist(fs, fid, n, fields, pn=1):
     raise last_err if last_err else RuntimeError("clist节点均失败")
 
 
+def market_opened(now=None):
+    """当前是否处于"交易日已开盘"状态(近似: 工作日且时间>=09:30)
+    2026-11-23 用户规则"选股取最后交易日数据": 已开盘用今日实时数据,
+    未开盘(盘前/周末/节假日)用上一交易日数据; 节假日按工作日近似(与
+    limitup_market_on既有的weekday近似口径一致)"""
+    now = now or datetime.datetime.now()
+    return now.weekday() < 5 and now.time() >= datetime.time(9, 30)
+
+
 def fetch_board_list(kind="concept", n=30):
     """板块榜(按当日涨幅降序): kind=concept(概念题材)/industry(行业板块)
     返回 list[{bk,name,pct,amount,up,down}]; 仅供实况展示/预热(热点判定走板块指数动量)"""
@@ -848,12 +857,18 @@ def fetch_board_list(kind="concept", n=30):
 
 
 def fetch_board_members(bk, n=15):
-    """板块成分股(按成交额降序): 返回 list[{code,name,price,pct,amount,...}]"""
+    """板块成分股(按成交额降序): 返回 list[{code,name,price,pct,amount,...}]
+    2026-11-23 用户规则"选股取最后交易日数据": 东财f2实时价在盘前/停牌时为空
+    (2026-11-18盘前宇宙为空的病根), 加请求f18昨收字段兜底——f2为空时
+    price取昨收(=上一交易日收盘), 即选股宇宙永远拿得到最后交易日价格;
+    开盘后f2为正常实时价"""
     _, diff = _clist("b:" + bk, "f6", n,
-                     "f12,f14,f2,f3,f6,f8,f9,f23,f26")
+                     "f12,f14,f2,f3,f6,f8,f9,f18,f23,f26")
     out = []
     for d in diff:
         p = _num(d.get("f2"))
+        if p is None:                           # 盘前/停牌: 实时价为空 -> 昨收兜底
+            p = _num(d.get("f18"))
         code = str(d.get("f12") or "")
         if p is None or len(code) != 6 or not code.isdigit():
             continue
